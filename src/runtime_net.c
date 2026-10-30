@@ -610,13 +610,9 @@ int32_t runtime_net_accept(int s, OrbisNetSockaddr *addr, uint32_t *addrlen) {
  * server sees that port and gives it to the peers. Same length as "3074": the request's
  * Content-Length stays right. BB_UPNP_PORT=3074 keeps the game's own. */
 static int upnp_external_port(void) {
-    static int port;
-    if (port) return port;
     const char *env = getenv("BB_UPNP_PORT");
-    if (env && atoi(env) >= 1024 && atoi(env) <= 9999) return port = atoi(env);
-    unsigned a = 0, b = 0, c = 0, d = 0;
-    port = sscanf(local_ipv4(), "%u.%u.%u.%u", &a, &b, &c, &d) == 4 && a != 127 ? 3075 + (int)(d & 255) : 3074;
-    return port;
+    if (env && atoi(env) >= 1024 && atoi(env) <= 9999) return atoi(env);
+    return 3074;
 }
 
 /* A copy of a UPnP SOAP request with <NewExternalPort>3074< replaced, or NULL when there is none. */
@@ -694,17 +690,6 @@ int32_t runtime_net_sendto(int s, const void *msg, size_t len, int flags, const 
         runtime_net_pkt_trace("sceNetSendto(fd=%d, len=%zu)", s, len);
     }
 
-    struct sockaddr_in server;
-    if (to && vs->tunnel && tunnel_server(&server)) {
-        /* Prevent the central server's fallback port (e.g. 165.1.125.122:40043) from hijacking
-         * peers away from Direct P2P or fast regional relays (Europa / Europa2). */
-        if (sin.sin_addr.s_addr == server.sin_addr.s_addr &&
-            sin.sin_port != server.sin_port &&
-            tun_best_relay(now_ms()) >= 0) {
-            return (int32_t)len;
-        }
-    }
-
     int ret = sendto(vs->s, (const char *)msg, (int)len, win_flags,
                      to ? (struct sockaddr *)&sin : NULL, to ? sizeof(sin) : 0);
     if (ret < 0) {
@@ -754,7 +739,7 @@ int32_t runtime_net_recv(int s, void *buf, size_t len, int flags) {
 }
 
 #define DEDUP_RING_SIZE 512
-#define DEDUP_WINDOW_MS 1500
+#define DEDUP_WINDOW_MS 60
 
 typedef struct {
     uint64_t hash;
@@ -769,7 +754,9 @@ static uint32_t g_dedup_head = 0;
 static uint32_t g_dedup_dropped = 0;
 
 static int is_duplicate_game_packet(uint32_t ip, uint16_t port, const uint8_t *data, int len, uint64_t now) {
-    if (len <= 0) return 0;
+    /* Ignore small Demonware control/ACK/probe packets (< 32 bytes) */
+    if (len < 32) return 0;
+
     uint64_t h = 14695981039346656037ULL;
     for (int i = 0; i < len; i++) {
         h ^= (uint64_t)data[i];
@@ -836,7 +823,7 @@ int32_t runtime_net_recvfrom(int s, void *buf, size_t len, int flags, OrbisNetSo
     char *into = tunnel ? (char *)wrapped : (char *)buf;
     const int cap = tunnel ? (int)sizeof(wrapped) : (int)len;
     int ret;
-next_datagram:
+next_datagram: /* after a tunnel control packet, which is not the game's */
     sin_len = sizeof(sin);
     ret = recvfrom(vs->s, into, cap, tunnel ? (win_flags & ~MSG_PEEK) : win_flags,
                    (struct sockaddr *)&sin, &sin_len);
@@ -946,6 +933,7 @@ int32_t runtime_net_setsockopt(int s, int level, int optname, const void *optval
         switch (optname) {
             case 0x0004: win_optname = SO_REUSEADDR; break;
             case 0x0008: win_optname = SO_KEEPALIVE; break;
+			case 0x0020: win_optname = SO_BROADCAST; break;
             case 0x0080: win_optname = SO_LINGER; break;
             case 0x0100: win_optname = SO_OOBINLINE; break;
             case 0x1001: /* SO_SNDBUF */
