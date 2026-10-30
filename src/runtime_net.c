@@ -112,6 +112,10 @@ typedef struct {
 static VSocket g_sockets[MAX_VIRTUAL_SOCKETS];
 static uint64_t now_ms(void);
 static int tunnel_server(struct sockaddr_in *out);
+/* The WebAPI invitation session can remain active in Arcade. A private race
+ * with another player has game UDP traffic to that peer before track assets
+ * load; Arcade has only server traffic. Let old peer activity expire when the
+ * player leaves the lobby. */
 static uint64_t g_last_game_peer_ms;
 
 int runtime_net_private_lobby_active(void) {
@@ -275,6 +279,11 @@ int32_t runtime_net_connect(int s, const OrbisNetSockaddr *addr, uint32_t addrle
     return ORBIS_OK;
 }
 
+/* Whether the RyuNET server runs on this machine: no server set, loopback, or one of this
+ * PC's own addresses (a Radmin/ZeroTier/LAN IP its friends also use). Only an address that
+ * belongs to this machine can be bound, which is how it is told apart. The game then must not
+ * take the server's UDP 3074: Windows lets both sockets bind it, and the game's NAT probes
+ * came back to the game itself instead of the server ("could not start the network"). */
 static int server_is_this_machine(void) {
     static int cached = -1;
     if (cached >= 0) return cached;
@@ -297,6 +306,11 @@ static int server_is_this_machine(void) {
     return cached;
 }
 
+/* This PC's address on the network it reaches the RyuNET server through (the LAN, or a
+ * Radmin/ZeroTier one). The game puts it in its host address as the local address, which
+ * players behind the same router (same public IP) connect through, as two PS4s at home do.
+ * 127.0.0.1 there made each of them connect to itself, so they could never join each other.
+ * Connecting a UDP socket sends nothing: it only asks the OS which route and source it uses. */
 static const char *local_ipv4(void) {
     static char cached[16];
     if (cached[0]) return cached;
@@ -338,6 +352,8 @@ static uint64_t now_ms(void) {
 #endif
 }
 
+/* The server's NAT port (UDP 3074, BB_ONLINE_NAT_PORT); 0 when the tunnel is off
+ * (BB_ONLINE_TUNNEL=0, offline, or the server's address does not resolve). */
 static int tunnel_server(struct sockaddr_in *out) {
     static int state = -1;
     static struct sockaddr_in server;
@@ -378,6 +394,8 @@ static struct sockaddr_in addr_of(uint32_t ip, uint16_t port) {
     return a;
 }
 
+/* Keeps this socket's paths open: to the server (asking for a pass for the regional relays
+ * unless BB_ONLINE_RELAYS=0) and, registered with that pass, to every relay. */
 static void tunnel_keepalive(VSocket *vs, const struct sockaddr_in *server) {
     static int relays_wanted = -1;
     if (relays_wanted < 0) {
@@ -407,6 +425,8 @@ static void tunnel_keepalive(VSocket *vs, const struct sockaddr_in *server) {
     }
 }
 
+/* RyuNET ping (runtime_net_ping.h): the round trip to the players in the room, on the game
+ * socket of a port with the tunnel. Off with BB_ONLINE_PING=0. */
 static int ping_enabled(void) {
     static int state = -1;
     if (state < 0) {
@@ -423,11 +443,14 @@ int runtime_net_ping_view(PingPeer *out, int max) {
 
 static void tunnel_copy(VSocket *vs, const void *msg, size_t len, const struct sockaddr_in *to);
 
+/* A ping packet the way the game's packets to that peer go: direct, and through the tunnel
+ * while the direct path is not proven. */
 static void ping_send(VSocket *vs, const uint8_t *packet, size_t n, const struct sockaddr_in *to) {
     sendto(vs->s, (const char *)packet, (int)n, 0, (const struct sockaddr *)to, sizeof(*to));
     tunnel_copy(vs, packet, n, to);
 }
 
+/* After the game's send to a peer: the pings that are due. */
 static void ping_after_send(VSocket *vs, const struct sockaddr_in *to) {
     struct sockaddr_in server;
     if (!ping_enabled() || !tunnel_server(&server)) return;
@@ -445,6 +468,7 @@ static void ping_after_send(VSocket *vs, const struct sockaddr_in *to) {
     }
 }
 
+/* A datagram from a peer (unwrapped): 1 when it was a ping packet, answered here. */
 static int ping_take(VSocket *vs, const uint8_t *data, int len, const struct sockaddr_in *from) {
     if (len < PING_MAGIC_LEN || memcmp(data, PING_MAGIC, PING_MAGIC_LEN) != 0 || !ping_enabled()) return 0;
     uint8_t reply[PING_PACKET_MAX];
@@ -456,6 +480,8 @@ static int ping_take(VSocket *vs, const uint8_t *data, int len, const struct soc
     return 1;
 }
 
+/* After the game's own send to a peer: a wrapped copy through the nearest relay and/or the
+ * server while the direct path is not proven both ways. */
 static void tunnel_copy(VSocket *vs, const void *msg, size_t len, const struct sockaddr_in *to) {
     struct sockaddr_in server;
     if (!vs->tunnel || !tunnel_server(&server)) return;
@@ -505,6 +531,8 @@ int32_t runtime_net_bind(int s, const OrbisNetSockaddr *addr, uint32_t addrlen) 
         sin.sin_port = htons(3075);
     }
 
+    /* Enable SO_REUSEADDR only for TCP streams. On UDP (Windows), SO_REUSEADDR allows port stealing
+     * which breaks local multi-instance testing. Keeping it off allows WSAEADDRINUSE to trigger the retry loop. */
     if (vs->is_stream) {
         int opt = 1;
         setsockopt(vs->s, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
@@ -573,6 +601,14 @@ int32_t runtime_net_accept(int s, OrbisNetSockaddr *addr, uint32_t *addrlen) {
     return vfd;
 }
 
+/* The game opens its UDP 3074 on the router through UPnP (AddPortMapping, external port 3074 to
+ * this PC's 3074). On a network with several players every PC asked for the same external port,
+ * and the router gave it to the last one: the others stopped receiving their lobby's traffic
+ * (kicked out of the lobby) or received another PC's (karts under the track, teleports), as the
+ * logs of three PCs behind one router showed (2026-10-19). Each PC now asks for its own external
+ * port, from its address on the network (3075 + the last byte), still to its local 3074; the
+ * server sees that port and gives it to the peers. Same length as "3074": the request's
+ * Content-Length stays right. BB_UPNP_PORT=3074 keeps the game's own. */
 static int upnp_external_port(void) {
     static int port;
     if (port) return port;
@@ -583,6 +619,7 @@ static int upnp_external_port(void) {
     return port;
 }
 
+/* A copy of a UPnP SOAP request with <NewExternalPort>3074< replaced, or NULL when there is none. */
 static char *upnp_rewrite(const void *msg, size_t len) {
     static const char tag[] = "<NewExternalPort>3074<";
     const char *data = (const char *)msg;
@@ -776,6 +813,8 @@ int32_t runtime_net_recvfrom(int s, void *buf, size_t len, int flags, OrbisNetSo
     NativeSockLen sin_len = sizeof(sin);
     struct sockaddr_in server;
     const int tunnel = vs->tunnel && tunnel_server(&server);
+    /* The game socket reads into a buffer with room for a tunnel header, which is stripped.
+     * A peek there takes the datagram and keeps it, unwrapped, for the next read. */
     static struct { int fd; int len; struct sockaddr_in from; uint8_t data[2048]; } peeked;
     if (tunnel && peeked.fd == s) {
         int ret = peeked.len > (int)len ? (int)len : peeked.len;
@@ -819,7 +858,9 @@ next_datagram:
         uint16_t port;
         int relay = -1;
         if (from_server(&sin, &server)) {
+            /* The server's pass and relay list. */
             if (tun_on_offer(wrapped, (size_t)ret, now_ms())) goto next_datagram;
+            /* The server's own NAT replies (0x15, 0x1F, 0x0B...) go to the game unchanged. */
             if (tun_unwrap(wrapped, (size_t)ret, &tflags, &ip, &port)) {
                 tun_on_tunnelled(ip, port, tflags, 0, now_ms());
                 if (tflags & TUN_FLAG_PING) ping_on_capable(ip, port, now_ms());
@@ -829,6 +870,8 @@ next_datagram:
                 ret -= TUN_HEADER_LEN;
             }
         } else if ((relay = tun_relay_index(sin.sin_addr.s_addr, ntohs(sin.sin_port))) >= 0) {
+            /* A relay: its registration replies, and peers' tunnelled packets. Nothing else
+             * from it is the game's. */
             if (!tun_unwrap(wrapped, (size_t)ret, &tflags, &ip, &port)) {
                 tun_on_register_reply(relay, wrapped, (size_t)ret, now_ms());
                 goto next_datagram;
@@ -846,6 +889,8 @@ next_datagram:
                 tun_best_relay(now_ms()) >= 0) {
                 goto next_datagram;
             }
+            /* BB_ONLINE_DIRECT=0 (tests): peers' direct packets are dropped, so the game's
+             * traffic with them has to come through the tunnel. */
             static int direct_off = -1;
             if (direct_off < 0) {
                 const char *v = getenv("BB_ONLINE_DIRECT");
@@ -861,7 +906,7 @@ next_datagram:
                 goto next_datagram;
             }
         }
-        if ((size_t)ret > len) ret = (int)len;
+        if ((size_t)ret > len) ret = (int)len; /* a datagram longer than the buffer is cut, as recvfrom does */
         memcpy(buf, payload, (size_t)ret);
     }
 
@@ -916,6 +961,8 @@ int32_t runtime_net_setsockopt(int s, int level, int optname, const void *optval
             case 0x1007: win_optname = SO_ERROR; break;
             case 0x1008: win_optname = SO_TYPE; break;
             default:
+                /* PS4 BSD options: 0x1105 (SO_PROTOCOL/PROTOTYPE), 0x0200 (SO_REUSEPORT),
+                 * 0x0800 (SO_NOSIGPIPE). Winsock does not implement them: ignore and succeed. */
                 runtime_net_trace("sceNetSetsockopt(fd=%d, level=0x%x, optname=0x%x, len=%u) ignored (PS4 BSD opt)",
                                   s, level, optname, optlen);
                 return ORBIS_OK;
