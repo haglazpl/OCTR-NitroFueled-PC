@@ -19,6 +19,7 @@ typedef struct {
     uint64_t last_use;
     uint64_t last_direct;
     uint64_t last_tunnel_send;
+    uint64_t last_tunnel_in; /* when its latest tunnelled packet came */
     uint64_t via_relay;    /* when it last answered through a relay (it has relays too) */
     uint64_t via_server;   /* when it last answered through the server */
 } TunPeer;
@@ -148,6 +149,12 @@ int tun_on_send(uint32_t ip, uint16_t port, uint64_t now_ms, uint8_t *flags, int
     p->last_use = now_ms;
     const int fresh = direct_fresh(p, now_ms);
     *flags = fresh ? 1 : 0;
+    /* Its tunnelled packets stopped while its direct ones keep coming (TUN_PEER_QUIET_MS): its last
+     * "not yet" is stale. Without this, a peer that rejoined and sent one tunnelled packet before
+     * our direct ones reached it got a copy of every packet for the rest of the session. */
+    if (fresh && !p->peer_ok && p->answered && p->last_tunnel_in && p->last_direct > p->last_tunnel_in &&
+        now_ms - p->last_tunnel_in >= TUN_PEER_QUIET_MS)
+        p->peer_ok = 1;
     int tunnel = !(fresh && p->peer_ok);
     if (tunnel && !p->answered && now_ms - p->first_send > TUN_GIVE_UP_MS) tunnel = 0;
     int route = 0;
@@ -183,6 +190,7 @@ void tun_on_tunnelled(uint32_t ip, uint16_t port, uint8_t flags, int via_relay, 
     TunPeer *p = peer_for(ip, port, now_ms, 1);
     p->peer_ok = flags & 1;
     p->answered = 1;
+    p->last_tunnel_in = now_ms;
     p->last_use = now_ms;
     if (via_relay) p->via_relay = now_ms;
     else p->via_server = now_ms;

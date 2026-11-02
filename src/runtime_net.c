@@ -87,7 +87,7 @@ int32_t runtime_net_init(void) {
 #endif
         net_overrides_init();
         g_net_initialized = 1;
-        runtime_net_trace("sceNetInit completed (NET-PATCH v3: peeks kept, per-player summary)");
+        runtime_net_trace("sceNetInit completed (NET-PATCH v4: peeks kept, per-player summary, one copy per datagram)");
     }
     runtime_friends_start();
     return ORBIS_OK;
@@ -679,6 +679,95 @@ static char *upnp_rewrite(const void *msg, size_t len) {
     return copy;
 }
 
+/* ---- Multipath copies ----------------------------------------------------------------------
+ * While the direct path to a peer is not proven both ways, the same datagram comes from it directly
+ * and through the tunnel (a relay, or the RyuNET server in Chile), up to a few hundred ms apart.
+ * The game must see it once, so a copy is dropped when the same bytes already came from that peer
+ * by another path within MP_WINDOW_MS. Counting per path keeps the game's own repeats (a resend
+ * after a lost ack comes by every path again): each of those still reaches the game once.
+ * BB_NET_MULTIPATH_DEDUP=0 turns it off. */
+#define MP_PEERS 16
+#define MP_RING 128
+#define MP_WINDOW_MS 1500u
+
+typedef struct {
+    uint64_t hash;
+    uint64_t at;
+    uint8_t count[3]; /* arrivals by path: direct, relay, server */
+} MpEntry;
+
+typedef struct {
+    uint32_t ip;
+    uint16_t port;
+    int used;
+    uint64_t last_use;
+    uint32_t head;
+    MpEntry e[MP_RING];
+} MpPeer;
+
+static MpPeer g_mp[MP_PEERS];
+static uint32_t g_mp_dropped;
+static atomic_flag g_mp_lock = ATOMIC_FLAG_INIT;
+
+static int multipath_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("BB_NET_MULTIPATH_DEDUP");
+        on = !(v && strcmp(v, "0") == 0);
+    }
+    return on;
+}
+
+/* 1 when this datagram is a copy of one the game already got from this peer by another path. */
+static int multipath_copy(const struct sockaddr_in *from, const uint8_t *data, int len, int route) {
+    if (len <= 0 || !multipath_enabled()) return 0;
+    const int path = route == TUN_VIA_RELAY ? 1 : route == TUN_VIA_SERVER ? 2 : 0;
+    uint64_t h = 14695981039346656037ULL ^ (uint64_t)len;
+    for (int i = 0; i < len; i++) {
+        h ^= data[i];
+        h *= 1099511628211ULL;
+    }
+    const uint32_t ip = from->sin_addr.s_addr;
+    const uint16_t port = from->sin_port;
+    const uint64_t now = now_ms();
+    int drop = 0;
+    while (atomic_flag_test_and_set_explicit(&g_mp_lock, memory_order_acquire)) {}
+    MpPeer *peer = NULL, *free_slot = NULL, *idlest = NULL;
+    for (int i = 0; i < MP_PEERS && !peer; i++) {
+        MpPeer *p = &g_mp[i];
+        if (p->used && p->ip == ip && p->port == port) peer = p;
+        else if (!p->used || now - p->last_use > 60000u) { if (!free_slot) free_slot = p; }
+        else if (!idlest || p->last_use < idlest->last_use) idlest = p;
+    }
+    if (!peer) {
+        peer = free_slot ? free_slot : idlest;
+        memset(peer, 0, sizeof(*peer));
+        peer->used = 1;
+        peer->ip = ip;
+        peer->port = port;
+    }
+    peer->last_use = now;
+    MpEntry *e = NULL;
+    for (int i = 0; i < MP_RING && !e; i++) {
+        MpEntry *c = &peer->e[i];
+        if (c->at && c->hash == h && now - c->at <= MP_WINDOW_MS) e = c;
+    }
+    if (!e) {
+        e = &peer->e[peer->head++ % MP_RING];
+        memset(e, 0, sizeof(*e));
+        e->hash = h;
+    }
+    e->at = now;
+    if (e->count[path] < 255) e->count[path]++;
+    int others = 0;
+    for (int k = 0; k < 3; k++)
+        if (k != path && e->count[k] > others) others = e->count[k];
+    drop = e->count[path] <= others;
+    atomic_flag_clear_explicit(&g_mp_lock, memory_order_release);
+    if (drop) __atomic_add_fetch(&g_mp_dropped, 1, __ATOMIC_RELAXED);
+    return drop;
+}
+
 /* ---- Per-player network summary ----------------------------------------------------------
  * Every 5 s (BB_NET_SUMMARY_MS; BB_NET_SUMMARY=0 turns it off) while the game socket talks to
  * other players, one line per player address: its nickname and ping (RyuNET ping), what arrived
@@ -901,13 +990,14 @@ static void netstat_maybe_report(void) {
     netstat_give();
     const uint32_t peeks = __atomic_exchange_n(&g_netstat_peeks, 0, __ATOMIC_RELAXED);
     const uint32_t read_gap = __atomic_exchange_n(&g_netstat_read_gap, 0, __ATOMIC_RELAXED);
+    const uint32_t copies_dropped = __atomic_exchange_n(&g_mp_dropped, 0, __ATOMIC_RELAXED);
     if (!n) return;
 
     const double secs = (double)(now - start) / 1000.0;
     char clock[16];
     netstat_clock(clock, sizeof(clock));
-    runtime_net_trace("Net %s summary (%.1f s): %d player address(es); longest wait between reads of the game socket %u ms; peeks %u",
-                      clock, secs, n, read_gap, peeks);
+    runtime_net_trace("Net %s summary (%.1f s): %d player address(es); longest wait between reads of the game socket %u ms; peeks %u; second copies dropped %u",
+                      clock, secs, n, read_gap, peeks, copies_dropped);
     for (int i = 0; i < n; i++) {
         const NetCounts *c = &snap[i].c;
         char name[PING_NAME + 2], ping[16], addr[24];
@@ -1116,7 +1206,10 @@ next_datagram: /* after a tunnel control packet, which is not the game's */
             tun_on_direct(sin.sin_addr.s_addr, ntohs(sin.sin_port), now_ms());
         }
         if (ping_take(vs, payload, ret, &sin)) goto next_datagram;
-        if (sin.sin_addr.s_addr != server.sin_addr.s_addr) netstat_on_recv(&sin, payload, ret, route_in);
+        if (sin.sin_addr.s_addr != server.sin_addr.s_addr) {
+            netstat_on_recv(&sin, payload, ret, route_in);
+            if (multipath_copy(&sin, payload, ret, route_in)) goto next_datagram; /* the game has it */
+        }
         /* A peek: the datagram has left the OS socket, so it is kept for the next read. */
         if ((win_flags & MSG_PEEK) && ret <= (int)sizeof(g_peeked.data)) {
             g_peeked.fd = s;

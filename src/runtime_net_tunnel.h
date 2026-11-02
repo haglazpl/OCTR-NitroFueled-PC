@@ -19,6 +19,10 @@
 /* A peer that never answers through the tunnel (a port without it) stops getting copies. */
 #define TUN_GIVE_UP_MS 20000u
 #define TUN_PEER_IDLE_MS 60000u
+/* A peer stops tunnelling only when our direct packets reach it and it has heard so from us. When
+ * its tunnelled packets have stopped this long while its direct ones keep coming, the "not yet" its
+ * last one carried is stale (it rejoined, say): our direct packets reach it, and copies stop. */
+#define TUN_PEER_QUIET_MS 2000u
 
 /* Regional relays (ryunet-relay; relay_pass.go on the server). The keepalive asks the server
  * for a pass (its signed word for the address it sees for this socket) and the relays' list:
