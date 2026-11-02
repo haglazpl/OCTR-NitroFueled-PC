@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <time.h>
+#include <stdatomic.h>
 
 #define ORBIS_OK 0
 #define ORBIS_NET_ENETUNREACH ((int32_t)0x80410133)
@@ -21,7 +22,17 @@
 #define NET_CTL_INVALID_ADDR  ((int32_t)0x80412107)
 
 static int g_net_initialized = 0;
-static int32_t g_net_errno = 0;
+/* sceNetErrnoLoc is per thread on the PS4. One value shared by every thread let a thread read
+ * another one's error (a failure in place of its own EWOULDBLOCK, for example). */
+static _Thread_local int32_t g_net_errno = 0;
+
+/* A Winsock error as the PS4's BSD errno (WSAExxx is 10000 + the BSD value). */
+static int32_t net_errno_from(int err) {
+#ifdef _WIN32
+    if (err > 10000 && err < 10100) return err - 10000;
+#endif
+    return err;
+}
 
 int runtime_net_is_online(void) {
     const char *val = getenv("BB_ONLINE");
@@ -76,7 +87,7 @@ int32_t runtime_net_init(void) {
 #endif
         net_overrides_init();
         g_net_initialized = 1;
-        runtime_net_trace("sceNetInit completed (NET-PATCH v2: 1MB buffers + multi-path dedup + relay lock)");
+        runtime_net_trace("sceNetInit completed (NET-PATCH v3: peeks kept, per-player summary)");
     }
     runtime_friends_start();
     return ORBIS_OK;
@@ -110,6 +121,11 @@ typedef struct {
 } VSocket;
 
 static VSocket g_sockets[MAX_VIRTUAL_SOCKETS];
+
+/* The game socket reads into a buffer with room for a tunnel header, which is stripped, so a
+ * peek there takes the datagram out of the OS socket: it is kept here, unwrapped, for the next
+ * read, and epoll reports the socket readable while it waits. fd 0: none. */
+static struct { int fd; int len; struct sockaddr_in from; uint8_t data[2048]; } g_peeked;
 static uint64_t now_ms(void);
 static int tunnel_server(struct sockaddr_in *out);
 /* The WebAPI invitation session can remain active in Arcade. A private race
@@ -126,8 +142,8 @@ int runtime_net_private_lobby_active(void) {
 
 static void note_game_peer(const VSocket *vs, const struct sockaddr_in *peer) {
     struct sockaddr_in server;
-    if (!vs->tunnel || !peer || !tunnel_server(&server)) return;
-    if (peer->sin_addr.s_addr == server.sin_addr.s_addr && peer->sin_port == server.sin_port) return;
+    if (!vs->tunnel || !peer || !tunnel_server(&server) ||
+        peer->sin_addr.s_addr == server.sin_addr.s_addr) return;
     const uint64_t now = now_ms();
     const uint64_t old = __atomic_exchange_n(&g_last_game_peer_ms, now, __ATOMIC_RELEASE);
     if (!old || now - old >= 5000) runtime_net_trace("Speed: game peer active");
@@ -189,15 +205,18 @@ int32_t runtime_net_socket(const char *name, int domain, int type, int protocol)
 
     SOCKET s = socket(win_domain, base_type, protocol);
     if (s == INVALID_SOCKET) {
-        g_net_errno = WSAGetLastError();
+        g_net_errno = net_errno_from(WSAGetLastError());
         runtime_net_trace("sceNetSocket failed: %d (win_domain=%d, base_type=%d, proto=%d)",
                           g_net_errno, win_domain, base_type, protocol);
         return -1;
     }
 
-    int buf_size = 1048576; /* 1 MB buffer for 6-8 player bursts */
-    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&buf_size, sizeof(buf_size));
-    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char *)&buf_size, sizeof(buf_size));
+    if (!is_stream) {
+        /* Room for bursts from 6-8 players (UDP only; TCP keeps Windows' auto-tuning). */
+        int buf_size = 1048576;
+        setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&buf_size, sizeof(buf_size));
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char *)&buf_size, sizeof(buf_size));
+    }
 
     if (is_nonblock) {
         unsigned long on = 1;
@@ -237,6 +256,7 @@ int32_t runtime_net_socket_close(int s) {
     if (!vs) return ORBIS_NET_EBADF;
 
     runtime_net_trace("sceNetSocketClose(fd=%d)", s);
+    if (g_peeked.fd == s) g_peeked.fd = 0;
     closesocket(vs->s);
     vsocket_free(s);
     return ORBIS_OK;
@@ -272,7 +292,7 @@ int32_t runtime_net_connect(int s, const OrbisNetSockaddr *addr, uint32_t addrle
             runtime_net_trace("sceNetConnect -> EINPROGRESS");
             return -1;
         }
-        g_net_errno = err;
+        g_net_errno = net_errno_from(err);
         runtime_net_trace("sceNetConnect failed: %d", err);
         return -1;
     }
@@ -344,7 +364,14 @@ static const char *local_ipv4(void) {
 
 static uint64_t now_ms(void) {
 #ifdef _WIN32
-    return (uint64_t)GetTickCount64();
+    /* QueryPerformanceCounter: GetTickCount64 moves in 15.6 ms steps, too coarse for the relay
+     * pings and the per-player summary. */
+    static LARGE_INTEGER freq;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    const uint64_t f = (uint64_t)freq.QuadPart, t = (uint64_t)c.QuadPart;
+    return (t / f) * 1000u + (t % f) * 1000u / f;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -441,7 +468,7 @@ int runtime_net_ping_view(PingPeer *out, int max) {
     return ping_view(now_ms(), out, max);
 }
 
-static void tunnel_copy(VSocket *vs, const void *msg, size_t len, const struct sockaddr_in *to);
+static int tunnel_copy(VSocket *vs, const void *msg, size_t len, const struct sockaddr_in *to);
 
 /* A ping packet the way the game's packets to that peer go: direct, and through the tunnel
  * while the direct path is not proven. */
@@ -481,21 +508,22 @@ static int ping_take(VSocket *vs, const uint8_t *data, int len, const struct soc
 }
 
 /* After the game's own send to a peer: a wrapped copy through the nearest relay and/or the
- * server while the direct path is not proven both ways. */
-static void tunnel_copy(VSocket *vs, const void *msg, size_t len, const struct sockaddr_in *to) {
+ * server while the direct path is not proven both ways. Returns the routes the copy took
+ * (TUN_VIA_SERVER, TUN_VIA_RELAY; 0: none), for the per-player summary. */
+static int tunnel_copy(VSocket *vs, const void *msg, size_t len, const struct sockaddr_in *to) {
     struct sockaddr_in server;
-    if (!vs->tunnel || !tunnel_server(&server)) return;
+    if (!vs->tunnel || !tunnel_server(&server)) return 0;
     tunnel_keepalive(vs, &server);
-    if (!tun_candidate(to->sin_addr.s_addr, server.sin_addr.s_addr) || len > 2048) return;
-    if (tun_relay_index(to->sin_addr.s_addr, ntohs(to->sin_port)) >= 0) return;
+    if (!tun_candidate(to->sin_addr.s_addr, server.sin_addr.s_addr) || len > 2048) return 0;
+    if (tun_relay_index(to->sin_addr.s_addr, ntohs(to->sin_port)) >= 0) return 0;
     uint8_t flags;
     int relay = -1;
-    const int route = tun_on_send(to->sin_addr.s_addr, ntohs(to->sin_port), now_ms(), &flags, &relay);
-    if (!route) return;
+    int route = tun_on_send(to->sin_addr.s_addr, ntohs(to->sin_port), now_ms(), &flags, &relay);
+    if (!route) return 0;
     if (ping_enabled()) flags |= TUN_FLAG_PING;
     uint8_t wrapped[2048 + TUN_HEADER_LEN];
     size_t n = tun_wrap(wrapped, sizeof(wrapped), flags, to->sin_addr.s_addr, ntohs(to->sin_port), msg, len);
-    if (!n) return;
+    if (!n) return 0;
     if (route & TUN_VIA_SERVER)
         sendto(vs->s, (const char *)wrapped, (int)n, 0, (const struct sockaddr *)&server, sizeof(server));
     uint32_t ip;
@@ -509,7 +537,10 @@ static void tunnel_copy(VSocket *vs, const void *msg, size_t len, const struct s
         }
         const struct sockaddr_in via = addr_of(ip, port);
         sendto(vs->s, (const char *)wrapped, (int)n, 0, (const struct sockaddr *)&via, sizeof(via));
+    } else {
+        route &= ~TUN_VIA_RELAY;
     }
+    return route;
 }
 
 int32_t runtime_net_bind(int s, const OrbisNetSockaddr *addr, uint32_t addrlen) {
@@ -549,7 +580,7 @@ int32_t runtime_net_bind(int s, const OrbisNetSockaddr *addr, uint32_t addrlen) 
         }
     }
     if (ret != 0) {
-        g_net_errno = WSAGetLastError();
+        g_net_errno = net_errno_from(WSAGetLastError());
         runtime_net_trace("sceNetBind(fd=%d, port=%u) failed: win err %d", s, ntohs(sin.sin_port), g_net_errno);
         return -1;
     }
@@ -568,7 +599,7 @@ int32_t runtime_net_listen(int s, int backlog) {
     runtime_net_trace("sceNetListen(fd=%d, backlog=%d)", s, backlog);
     int ret = listen(vs->s, backlog);
     if (ret != 0) {
-        g_net_errno = WSAGetLastError();
+        g_net_errno = net_errno_from(WSAGetLastError());
         return -1;
     }
     return ORBIS_OK;
@@ -582,7 +613,7 @@ int32_t runtime_net_accept(int s, OrbisNetSockaddr *addr, uint32_t *addrlen) {
     NativeSockLen sin_len = sizeof(sin);
     SOCKET client = accept(vs->s, (struct sockaddr *)&sin, &sin_len);
     if (client == INVALID_SOCKET) {
-        g_net_errno = WSAGetLastError();
+        g_net_errno = net_errno_from(WSAGetLastError());
         return -1;
     }
 
@@ -610,9 +641,13 @@ int32_t runtime_net_accept(int s, OrbisNetSockaddr *addr, uint32_t *addrlen) {
  * server sees that port and gives it to the peers. Same length as "3074": the request's
  * Content-Length stays right. BB_UPNP_PORT=3074 keeps the game's own. */
 static int upnp_external_port(void) {
+    static int port;
+    if (port) return port;
     const char *env = getenv("BB_UPNP_PORT");
-    if (env && atoi(env) >= 1024 && atoi(env) <= 9999) return atoi(env);
-    return 3074;
+    if (env && atoi(env) >= 1024 && atoi(env) <= 9999) return port = atoi(env);
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    port = sscanf(local_ipv4(), "%u.%u.%u.%u", &a, &b, &c, &d) == 4 && a != 127 ? 3075 + (int)(d & 255) : 3074;
+    return port;
 }
 
 /* A copy of a UPnP SOAP request with <NewExternalPort>3074< replaced, or NULL when there is none. */
@@ -644,6 +679,251 @@ static char *upnp_rewrite(const void *msg, size_t len) {
     return copy;
 }
 
+/* ---- Per-player network summary ----------------------------------------------------------
+ * Every 5 s (BB_NET_SUMMARY_MS; BB_NET_SUMMARY=0 turns it off) while the game socket talks to
+ * other players, one line per player address: its nickname and ping (RyuNET ping), what arrived
+ * from it and by which path (direct, a regional relay, the RyuNET server), the same datagram
+ * arriving twice within a second (several paths at once: counted, not dropped), what was sent to
+ * it and how many tunnelled copies went along, and the longest silence between two of its
+ * datagrams. A silence of 500 ms or more is logged when it ends, with the wall-clock time, so a
+ * glitch seen on screen can be found in the log. A header line gives the longest wait between two
+ * reads of the game socket on this PC: when it is as long as a player's silence, this PC was the
+ * one that stalled. */
+#define NETSTAT_MAX_PEERS 16
+#define NETSTAT_DUP_RING 64
+#define NETSTAT_DUP_WINDOW_MS 1000u
+#define NETSTAT_IDLE_MS 60000u
+#define NETSTAT_SILENCE_MS 500u
+
+typedef struct {
+    uint32_t in_direct, in_relay, in_server, in_bytes, dups;
+    uint32_t out_pkts, out_bytes, copies_relay, copies_server;
+    uint32_t gap_max, gaps_100, gaps_250;
+} NetCounts;
+
+typedef struct {
+    uint32_t ip;
+    uint16_t port;
+    int used;
+    uint64_t last_in;
+    uint64_t last_use;
+    NetCounts c;
+    uint64_t dup_hash[NETSTAT_DUP_RING];
+    uint64_t dup_at[NETSTAT_DUP_RING];
+    uint32_t dup_head;
+} NetStat;
+
+static NetStat g_netstat[NETSTAT_MAX_PEERS];
+static uint64_t g_netstat_window;    /* start of the current window, 0 before the first */
+static uint32_t g_netstat_peeks;
+static uint32_t g_netstat_read_gap;  /* longest wait between two reads of the game socket */
+static uint64_t g_netstat_last_read;
+static atomic_flag g_netstat_lock = ATOMIC_FLAG_INIT;
+
+static void netstat_take(void) { while (atomic_flag_test_and_set_explicit(&g_netstat_lock, memory_order_acquire)) {} }
+static void netstat_give(void) { atomic_flag_clear_explicit(&g_netstat_lock, memory_order_release); }
+
+static uint32_t netstat_interval(void) {
+    static int ms = -1;
+    if (ms < 0) {
+        const char *off = getenv("BB_NET_SUMMARY");
+        const char *v = getenv("BB_NET_SUMMARY_MS");
+        ms = (off && strcmp(off, "0") == 0) ? 0 : (v && atoi(v) >= 1000 ? atoi(v) : 5000);
+    }
+    return (uint32_t)ms;
+}
+
+/* This peer's entry, made (in a free or the idlest slot) with create. Holds the lock. */
+static NetStat *netstat_peer(uint32_t ip, uint16_t port, uint64_t now, int create) {
+    NetStat *free_slot = NULL, *idlest = NULL;
+    for (int i = 0; i < NETSTAT_MAX_PEERS; i++) {
+        NetStat *p = &g_netstat[i];
+        if (p->used && p->ip == ip && p->port == port) return p;
+        if (!p->used || now - p->last_use > NETSTAT_IDLE_MS) {
+            if (!free_slot) free_slot = p;
+        } else if (!idlest || p->last_use < idlest->last_use) {
+            idlest = p;
+        }
+    }
+    if (!create) return NULL;
+    NetStat *p = free_slot ? free_slot : idlest;
+    memset(p, 0, sizeof(*p));
+    p->used = 1;
+    p->ip = ip;
+    p->port = port;
+    p->last_use = now;
+    return p;
+}
+
+static void netstat_addr(uint32_t ip, uint16_t port, char *out, size_t cap) {
+    const uint8_t *b = (const uint8_t *)&ip;
+    snprintf(out, cap, "%u.%u.%u.%u:%u", b[0], b[1], b[2], b[3], port);
+}
+
+static void netstat_clock(char *out, size_t cap) {
+    const time_t t = time(NULL);
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+#ifdef _WIN32
+    const struct tm *l = localtime(&t); /* thread-local buffer in the Windows CRT */
+    if (l) tm = *l;
+#else
+    localtime_r(&t, &tm);
+#endif
+    strftime(out, cap, "%H:%M:%S", &tm);
+}
+
+/* "name" from the RyuNET ping, or "?"; the ping as text. */
+static void netstat_who(uint32_t ip, uint16_t port, uint64_t now, char *name, size_t name_cap, char *ping, size_t ping_cap) {
+    char n[PING_NAME];
+    const int ms = ping_peer(ip, port, now, n);
+    snprintf(name, name_cap, "%s", n[0] ? n : "?");
+    if (ms >= 0) snprintf(ping, ping_cap, "%d ms", ms);
+    else if (ms == PING_NO_ANSWER) snprintf(ping, ping_cap, "no answer");
+    else if (ms == PING_OLDER_PORT) snprintf(ping, ping_cap, "older port");
+    else snprintf(ping, ping_cap, "n/a");
+}
+
+static const char *netstat_route(int route) {
+    return route == TUN_VIA_RELAY ? "relay" : route == TUN_VIA_SERVER ? "server" : "direct";
+}
+
+/* Each read of the game socket, data or not. */
+static void netstat_on_read_call(void) {
+    if (!netstat_interval()) return;
+    const uint64_t now = now_ms();
+    const uint64_t last = __atomic_exchange_n(&g_netstat_last_read, now, __ATOMIC_RELAXED);
+    if (!last || now <= last || now - last > 10000u) return; /* not reading at all: not a stall */
+    const uint32_t gap = (uint32_t)(now - last);
+    if (gap > __atomic_load_n(&g_netstat_read_gap, __ATOMIC_RELAXED))
+        __atomic_store_n(&g_netstat_read_gap, gap, __ATOMIC_RELAXED);
+}
+
+static void netstat_on_peek(void) {
+    __atomic_add_fetch(&g_netstat_peeks, 1, __ATOMIC_RELAXED);
+}
+
+static void netstat_on_send(const struct sockaddr_in *to, size_t len, int route) {
+    struct sockaddr_in server;
+    if (!netstat_interval() || !tunnel_server(&server) || to->sin_addr.s_addr == server.sin_addr.s_addr) return;
+    const uint64_t now = now_ms();
+    netstat_take();
+    NetStat *p = netstat_peer(to->sin_addr.s_addr, ntohs(to->sin_port), now, 1);
+    p->last_use = now;
+    p->c.out_pkts++;
+    p->c.out_bytes += (uint32_t)len;
+    if (route & TUN_VIA_RELAY) p->c.copies_relay++;
+    if (route & TUN_VIA_SERVER) p->c.copies_server++;
+    netstat_give();
+}
+
+/* A game datagram from a player (unwrapped), and the path it came by. */
+static void netstat_on_recv(const struct sockaddr_in *from, const uint8_t *data, int len, int route) {
+    if (!netstat_interval() || len <= 0) return;
+    const uint64_t now = now_ms();
+    const uint32_t ip = from->sin_addr.s_addr;
+    const uint16_t port = ntohs(from->sin_port);
+    uint32_t silence = 0;
+    netstat_take();
+    NetStat *p = netstat_peer(ip, port, now, 1);
+    p->last_use = now;
+    if (route == TUN_VIA_RELAY) p->c.in_relay++;
+    else if (route == TUN_VIA_SERVER) p->c.in_server++;
+    else p->c.in_direct++;
+    p->c.in_bytes += (uint32_t)len;
+    if (p->last_in && now > p->last_in) {
+        const uint64_t gap = now - p->last_in;
+        if (gap < NETSTAT_IDLE_MS) {
+            if (gap > p->c.gap_max) p->c.gap_max = (uint32_t)gap;
+            if (gap >= 100) p->c.gaps_100++;
+            if (gap >= 250) p->c.gaps_250++;
+            if (gap >= NETSTAT_SILENCE_MS) silence = (uint32_t)gap;
+        }
+    }
+    p->last_in = now;
+    if (len >= 32) {
+        uint64_t h = 14695981039346656037ULL;
+        for (int i = 0; i < len; i++) {
+            h ^= data[i];
+            h *= 1099511628211ULL;
+        }
+        int dup = 0;
+        for (int i = 0; i < NETSTAT_DUP_RING && !dup; i++)
+            dup = p->dup_at[i] && p->dup_hash[i] == h && now - p->dup_at[i] <= NETSTAT_DUP_WINDOW_MS;
+        if (dup) {
+            p->c.dups++;
+        } else {
+            const uint32_t k = p->dup_head++ % NETSTAT_DUP_RING;
+            p->dup_hash[k] = h;
+            p->dup_at[k] = now;
+        }
+    }
+    netstat_give();
+    if (silence) {
+        char name[PING_NAME + 2], ping[16], addr[24], clock[16];
+        netstat_who(ip, port, now, name, sizeof(name), ping, sizeof(ping));
+        netstat_addr(ip, port, addr, sizeof(addr));
+        netstat_clock(clock, sizeof(clock));
+        runtime_net_trace("Net %s: nothing from %s (%s) for %u ms, back now (%s, ping %s)",
+                          clock, name, addr, silence, netstat_route(route), ping);
+    }
+}
+
+/* The summary when the window is over (any thread; one of them prints it). */
+static void netstat_maybe_report(void) {
+    const uint32_t interval = netstat_interval();
+    if (!interval) return;
+    const uint64_t now = now_ms();
+    uint64_t start = __atomic_load_n(&g_netstat_window, __ATOMIC_ACQUIRE);
+    if (!start) {
+        __atomic_compare_exchange_n(&g_netstat_window, &start, now, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        return;
+    }
+    if (now < start || now - start < interval) return;
+    if (!__atomic_compare_exchange_n(&g_netstat_window, &start, now, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return;
+
+    struct { uint32_t ip; uint16_t port; NetCounts c; } snap[NETSTAT_MAX_PEERS];
+    int n = 0;
+    netstat_take();
+    for (int i = 0; i < NETSTAT_MAX_PEERS; i++) {
+        NetStat *p = &g_netstat[i];
+        if (!p->used) continue;
+        const NetCounts *c = &p->c;
+        if (c->in_direct + c->in_relay + c->in_server + c->out_pkts) {
+            snap[n].ip = p->ip;
+            snap[n].port = p->port;
+            snap[n].c = p->c;
+            n++;
+        }
+        memset(&p->c, 0, sizeof(p->c));
+    }
+    netstat_give();
+    const uint32_t peeks = __atomic_exchange_n(&g_netstat_peeks, 0, __ATOMIC_RELAXED);
+    const uint32_t read_gap = __atomic_exchange_n(&g_netstat_read_gap, 0, __ATOMIC_RELAXED);
+    if (!n) return;
+
+    const double secs = (double)(now - start) / 1000.0;
+    char clock[16];
+    netstat_clock(clock, sizeof(clock));
+    runtime_net_trace("Net %s summary (%.1f s): %d player address(es); longest wait between reads of the game socket %u ms; peeks %u",
+                      clock, secs, n, read_gap, peeks);
+    for (int i = 0; i < n; i++) {
+        const NetCounts *c = &snap[i].c;
+        char name[PING_NAME + 2], ping[16], addr[24];
+        netstat_who(snap[i].ip, snap[i].port, now, name, sizeof(name), ping, sizeof(ping));
+        netstat_addr(snap[i].ip, snap[i].port, addr, sizeof(addr));
+        const uint32_t in = c->in_direct + c->in_relay + c->in_server;
+        runtime_net_trace("Net   %-16s %-21s ping %-10s| in %u (%.0f/s, %.1f KB/s): direct %u, relay %u, server %u, twice %u"
+                          " | out %u (%.0f/s, %.1f KB/s), tunnel copies relay %u, server %u"
+                          " | longest silence %u ms, >=100 ms x%u, >=250 ms x%u",
+                          name, addr, ping, in, in / secs, c->in_bytes / 1024.0 / secs,
+                          c->in_direct, c->in_relay, c->in_server, c->dups,
+                          c->out_pkts, c->out_pkts / secs, c->out_bytes / 1024.0 / secs,
+                          c->copies_relay, c->copies_server, c->gap_max, c->gaps_100, c->gaps_250);
+    }
+}
+
 int32_t runtime_net_send(int s, const void *msg, size_t len, int flags) {
     VSocket *vs = vsocket_get(s);
     if (!vs) return ORBIS_NET_EBADF;
@@ -661,7 +941,7 @@ int32_t runtime_net_send(int s, const void *msg, size_t len, int flags) {
             g_net_errno = 35; /* EWOULDBLOCK */
             return -1;
         }
-        g_net_errno = err;
+        g_net_errno = net_errno_from(err);
         runtime_net_trace("sceNetSend(fd=%d, len=%zu, flags=0x%x) -> err %d (wsa %d)", s, len, flags, g_net_errno, err);
         return -1;
     }
@@ -698,14 +978,16 @@ int32_t runtime_net_sendto(int s, const void *msg, size_t len, int flags, const 
             g_net_errno = 35;
             return -1;
         }
-        g_net_errno = err;
+        g_net_errno = net_errno_from(err);
         runtime_net_trace("sceNetSendto(fd=%d) failed: win err %d", s, err);
         return -1;
     }
     note_game_peer(vs, to ? &sin : NULL);
     if (to && vs->tunnel) {
-        tunnel_copy(vs, msg, len, &sin);
+        const int route = tunnel_copy(vs, msg, len, &sin);
+        netstat_on_send(&sin, len, route);
         ping_after_send(vs, &sin);
+        netstat_maybe_report();
     }
     return ret;
 }
@@ -726,7 +1008,7 @@ int32_t runtime_net_recv(int s, void *buf, size_t len, int flags) {
             g_net_errno = 35;
             return -1;
         }
-        g_net_errno = err;
+        g_net_errno = net_errno_from(err);
         runtime_net_trace("sceNetRecv(fd=%d, len=%zu, flags=0x%x) -> err %d (wsa %d)", s, len, flags, g_net_errno, err);
         return -1;
     }
@@ -736,55 +1018,6 @@ int32_t runtime_net_recv(int s, void *buf, size_t len, int flags) {
         runtime_net_pkt_trace("sceNetRecv(fd=%d) -> EOF (0 bytes)", s);
     }
     return ret;
-}
-
-#define DEDUP_RING_SIZE 512
-#define DEDUP_WINDOW_MS 60
-
-typedef struct {
-    uint64_t hash;
-    uint32_t peer_ip;
-    uint16_t peer_port;
-    uint16_t len;
-    uint64_t ts_ms;
-} DedupEntry;
-
-static DedupEntry g_dedup_ring[DEDUP_RING_SIZE];
-static uint32_t g_dedup_head = 0;
-static uint32_t g_dedup_dropped = 0;
-
-static int is_duplicate_game_packet(uint32_t ip, uint16_t port, const uint8_t *data, int len, uint64_t now) {
-    /* Ignore small Demonware control/ACK/probe packets (< 32 bytes) */
-    if (len < 32) return 0;
-
-    uint64_t h = 14695981039346656037ULL;
-    for (int i = 0; i < len; i++) {
-        h ^= (uint64_t)data[i];
-        h *= 1099511628211ULL;
-    }
-    for (int i = 0; i < DEDUP_RING_SIZE; i++) {
-        const DedupEntry *e = &g_dedup_ring[i];
-        if (e->hash == h && e->peer_ip == ip && e->peer_port == port && e->len == (uint16_t)len) {
-            if (now >= e->ts_ms && (now - e->ts_ms) <= DEDUP_WINDOW_MS) {
-                g_dedup_dropped++;
-                if (g_dedup_dropped == 1 || (g_dedup_dropped % 25) == 0) {
-                    struct in_addr a;
-                    a.s_addr = ip;
-                    runtime_net_trace("[NET-PATCH] Dropped duplicate multi-path packet #%u from %s:%u (len=%d)",
-                                      g_dedup_dropped, inet_ntoa(a), port, len);
-                }
-                return 1;
-            }
-        }
-    }
-    DedupEntry *slot = &g_dedup_ring[g_dedup_head & (DEDUP_RING_SIZE - 1)];
-    g_dedup_head++;
-    slot->hash = h;
-    slot->peer_ip = ip;
-    slot->peer_port = port;
-    slot->len = (uint16_t)len;
-    slot->ts_ms = now;
-    return 0;
 }
 
 int32_t runtime_net_recvfrom(int s, void *buf, size_t len, int flags, OrbisNetSockaddr *from, uint32_t *fromlen) {
@@ -800,14 +1033,13 @@ int32_t runtime_net_recvfrom(int s, void *buf, size_t len, int flags, OrbisNetSo
     NativeSockLen sin_len = sizeof(sin);
     struct sockaddr_in server;
     const int tunnel = vs->tunnel && tunnel_server(&server);
-    /* The game socket reads into a buffer with room for a tunnel header, which is stripped.
-     * A peek there takes the datagram and keeps it, unwrapped, for the next read. */
-    static struct { int fd; int len; struct sockaddr_in from; uint8_t data[2048]; } peeked;
-    if (tunnel && peeked.fd == s) {
-        int ret = peeked.len > (int)len ? (int)len : peeked.len;
-        memcpy(buf, peeked.data, (size_t)ret);
-        sin = peeked.from;
-        if (!(win_flags & MSG_PEEK)) peeked.fd = 0;
+    if (tunnel) netstat_on_read_call();
+    /* A datagram kept from a peek (g_peeked) comes first. */
+    if (tunnel && g_peeked.fd == s) {
+        int ret = g_peeked.len > (int)len ? (int)len : g_peeked.len;
+        memcpy(buf, g_peeked.data, (size_t)ret);
+        sin = g_peeked.from;
+        if (!(win_flags & MSG_PEEK)) g_peeked.fd = 0;
         if (from) {
             OrbisNetSockaddrIn *out = (OrbisNetSockaddrIn *)from;
             out->sin_len = sizeof(OrbisNetSockaddrIn);
@@ -829,12 +1061,11 @@ next_datagram: /* after a tunnel control packet, which is not the game's */
                    (struct sockaddr *)&sin, &sin_len);
     if (ret < 0) {
         int err = WSAGetLastError();
-        if (err == WSAECONNRESET || err == WSAENETRESET) goto next_datagram;
         if (err == WSAEWOULDBLOCK) {
             g_net_errno = 35;
             return -1;
         }
-        g_net_errno = err;
+        g_net_errno = net_errno_from(err);
         return -1;
     }
     if (tunnel) {
@@ -844,6 +1075,7 @@ next_datagram: /* after a tunnel control packet, which is not the game's */
         uint32_t ip;
         uint16_t port;
         int relay = -1;
+        int route_in = 0; /* 0 direct, TUN_VIA_RELAY or TUN_VIA_SERVER: for the summary */
         if (from_server(&sin, &server)) {
             /* The server's pass and relay list. */
             if (tun_on_offer(wrapped, (size_t)ret, now_ms())) goto next_datagram;
@@ -855,6 +1087,7 @@ next_datagram: /* after a tunnel control packet, which is not the game's */
                 sin.sin_port = htons(port);
                 payload = wrapped + TUN_HEADER_LEN;
                 ret -= TUN_HEADER_LEN;
+                route_in = TUN_VIA_SERVER;
             }
         } else if ((relay = tun_relay_index(sin.sin_addr.s_addr, ntohs(sin.sin_port))) >= 0) {
             /* A relay: its registration replies, and peers' tunnelled packets. Nothing else
@@ -869,13 +1102,8 @@ next_datagram: /* after a tunnel control packet, which is not the game's */
             sin.sin_port = htons(port);
             payload = wrapped + TUN_HEADER_LEN;
             ret -= TUN_HEADER_LEN;
+            route_in = TUN_VIA_RELAY;
         } else {
-            /* Ignore central server fallback port (e.g. 165.1.125.122:40043) when a regional relay is active */
-            if (sin.sin_addr.s_addr == server.sin_addr.s_addr &&
-                sin.sin_port != server.sin_port &&
-                tun_best_relay(now_ms()) >= 0) {
-                goto next_datagram;
-            }
             /* BB_ONLINE_DIRECT=0 (tests): peers' direct packets are dropped, so the game's
              * traffic with them has to come through the tunnel. */
             static int direct_off = -1;
@@ -888,10 +1116,14 @@ next_datagram: /* after a tunnel control packet, which is not the game's */
             tun_on_direct(sin.sin_addr.s_addr, ntohs(sin.sin_port), now_ms());
         }
         if (ping_take(vs, payload, ret, &sin)) goto next_datagram;
-        if (!(win_flags & MSG_PEEK) && !from_server(&sin, &server)) {
-            if (is_duplicate_game_packet(sin.sin_addr.s_addr, ntohs(sin.sin_port), payload, ret, now_ms())) {
-                goto next_datagram;
-            }
+        if (sin.sin_addr.s_addr != server.sin_addr.s_addr) netstat_on_recv(&sin, payload, ret, route_in);
+        /* A peek: the datagram has left the OS socket, so it is kept for the next read. */
+        if ((win_flags & MSG_PEEK) && ret <= (int)sizeof(g_peeked.data)) {
+            g_peeked.fd = s;
+            g_peeked.len = ret;
+            g_peeked.from = sin;
+            memcpy(g_peeked.data, payload, (size_t)ret);
+            netstat_on_peek();
         }
         if ((size_t)ret > len) ret = (int)len; /* a datagram longer than the buffer is cut, as recvfrom does */
         memcpy(buf, payload, (size_t)ret);
@@ -910,6 +1142,7 @@ next_datagram: /* after a tunnel control packet, which is not the game's */
     if (fromlen) *fromlen = sizeof(OrbisNetSockaddrIn);
 
     runtime_net_pkt_trace("sceNetRecvfrom(fd=%d, len=%d, from=%s:%u)", s, ret, inet_ntoa(sin.sin_addr), ntohs(sin.sin_port));
+    if (tunnel) netstat_maybe_report();
     return ret;
 }
 
@@ -933,17 +1166,11 @@ int32_t runtime_net_setsockopt(int s, int level, int optname, const void *optval
         switch (optname) {
             case 0x0004: win_optname = SO_REUSEADDR; break;
             case 0x0008: win_optname = SO_KEEPALIVE; break;
-			case 0x0020: win_optname = SO_BROADCAST; break;
+            case 0x0020: win_optname = SO_BROADCAST; break;
             case 0x0080: win_optname = SO_LINGER; break;
             case 0x0100: win_optname = SO_OOBINLINE; break;
-            case 0x1001: /* SO_SNDBUF */
-            case 0x1002: /* SO_RCVBUF */ {
-                win_optname = (optname == 0x1001) ? SO_SNDBUF : SO_RCVBUF;
-                int req = (optval && optlen >= sizeof(int)) ? *(const int *)optval : 0;
-                int clamped = (req < 1048576) ? 1048576 : req;
-                setsockopt(vs->s, SOL_SOCKET, win_optname, (const char *)&clamped, sizeof(clamped));
-                return ORBIS_OK;
-            }
+            case 0x1001: win_optname = SO_SNDBUF; break;
+            case 0x1002: win_optname = SO_RCVBUF; break;
             case 0x1005: win_optname = SO_SNDTIMEO; break;
             case 0x1006: win_optname = SO_RCVTIMEO; break;
             case 0x1007: win_optname = SO_ERROR; break;
@@ -1141,16 +1368,31 @@ int32_t runtime_net_epoll_wait(int eid, OrbisNetEpollEvent *events, int maxevent
         }
     }
 
+    /* A datagram kept from a peek is no longer in the OS socket: that socket is readable now. */
+    const int peek_fd = g_peeked.fd;
+    int peek_pending = 0;
+    for (int i = 0; i < ep->entry_count; i++)
+        if (peek_fd && ep->entries[i].socket_fd == peek_fd && (ep->entries[i].events & ORBIS_NET_EPOLLIN))
+            peek_pending = 1;
+
     struct timeval tv;
     struct timeval *ptv = NULL;
-    if (timeout_usec >= 0) {
-        tv.tv_sec = timeout_usec / 1000000;
-        tv.tv_usec = timeout_usec % 1000000;
+    if (timeout_usec >= 0 || peek_pending) {
+        const int t = peek_pending ? 0 : timeout_usec;
+        tv.tv_sec = t / 1000000;
+        tv.tv_usec = t % 1000000;
         ptv = &tv;
     }
 
     int ret = select((int)(max_sock + 1), &read_fds, &write_fds, &except_fds, ptv);
-    if (ret <= 0) return 0;
+    if (ret < 0) {
+        if (!peek_pending) return 0;
+        FD_ZERO(&read_fds);
+        FD_ZERO(&write_fds);
+        FD_ZERO(&except_fds);
+    } else if (ret == 0 && !peek_pending) {
+        return 0;
+    }
 
     int out_count = 0;
     for (int i = 0; i < ep->entry_count && out_count < maxevents; i++) {
@@ -1158,7 +1400,9 @@ int32_t runtime_net_epoll_wait(int eid, OrbisNetEpollEvent *events, int maxevent
         if (!vs) continue;
 
         uint32_t revents = 0;
-        if (FD_ISSET(vs->s, &read_fds)) revents |= ORBIS_NET_EPOLLIN;
+        if (FD_ISSET(vs->s, &read_fds) ||
+            (peek_pending && ep->entries[i].socket_fd == peek_fd && (ep->entries[i].events & ORBIS_NET_EPOLLIN)))
+            revents |= ORBIS_NET_EPOLLIN;
         if (FD_ISSET(vs->s, &write_fds)) {
             revents |= ORBIS_NET_EPOLLOUT;
             if (ep->entries[i].events & 0x00000004) revents |= 0x00000004;

@@ -30,7 +30,7 @@ extern "C" {
 #define PING_FRESH_MS 4000u
 #define TUN_FLAG_PING 2
 
-enum { PING_NO_ANSWER = -1, PING_OLDER_PORT = -2 };
+enum { PING_NO_ANSWER = -1, PING_OLDER_PORT = -2, PING_NOT_TRACKED = -3 };
 typedef struct {
     char name[PING_NAME]; /* "" for a port without the ping */
     int ms;               /* the smoothed round trip, PING_NO_ANSWER or PING_OLDER_PORT */
@@ -51,6 +51,10 @@ int ping_on_packet(const uint8_t *in, size_t len, uint32_t ip, uint16_t port, ui
                    uint8_t *reply, size_t cap, size_t *reply_len);
 /* The players in the room (the peers the game sends to), by nickname: their count. */
 int ping_view(uint64_t now_ms, PingPeer *out, int max);
+
+/* One peer by address (the per-player network summary): its round trip as ping_view gives it, or
+ * PING_NOT_TRACKED (a LAN peer, or none yet); *name (PING_NAME bytes) its nickname or "". */
+int ping_peer(uint32_t ip, uint16_t port, uint64_t now_ms, char *name);
 
 /* runtime_net.c: ping_view now, for the menu. */
 int runtime_net_ping_view(PingPeer *out, int max);
