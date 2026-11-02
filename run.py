@@ -493,6 +493,75 @@ def update_notice(env, version):
         say(f'A newer release is available: {tag} (update from the launcher)')
 
 
+def time_server_offset(budget=3.0):
+    """(microseconds, server, round trip ms): the time servers' clock minus this PC's, by SNTP (UDP
+    123), the best of up to three exchanges with the first server that answers; None when none does
+    within budget seconds."""
+    import socket
+    import struct
+
+    def ntp_seconds(field):
+        sec, frac = struct.unpack('>II', field)
+        return sec - 2208988800 + frac / 2**32 if sec else 0.0
+
+    def ntp_field(t):
+        return struct.pack('>II', int(t) + 2208988800, int((t - int(t)) * 2**32) & 0xFFFFFFFF)
+
+    deadline = time.monotonic() + budget
+    for server in ('time.windows.com', 'pool.ntp.org', 'time.google.com'):
+        if time.monotonic() >= deadline:
+            break
+        try:
+            address = socket.getaddrinfo(server, 123, socket.AF_INET, socket.SOCK_DGRAM)[0][4]
+        except OSError:
+            continue
+        best = None
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            for _ in range(3):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                s.settimeout(min(0.7, left))
+                t1 = time.time()
+                stamp = ntp_field(t1)  # echoed back as the reply's origin: a late answer is not taken
+                try:
+                    s.sendto(b'\x23' + bytes(39) + stamp, address)
+                    reply = s.recv(128)
+                except OSError:
+                    continue
+                t4 = time.time()
+                if len(reply) < 48 or reply[0] & 7 != 4 or reply[24:32] != stamp:
+                    continue
+                t2, t3 = ntp_seconds(reply[32:40]), ntp_seconds(reply[40:48])
+                if not t2 or not t3:
+                    continue
+                rtt = (t4 - t1) - (t3 - t2)
+                if rtt >= 0 and (best is None or rtt < best[1]):
+                    best = ((t2 - t1 + t3 - t4) / 2, rtt)
+        if best:
+            return round(best[0] * 1e6), server, best[1] * 1000
+    return None
+
+
+def setup_game_clock(env):
+    """The game's wall clock (net5): PS4s keep their clocks network-synced and the game's network
+    code reads the wall clock, while PCs were seconds apart. The time servers' offset goes to the
+    runtime (BB_CLOCK_OFFSET_US), which adds it wherever the game reads the wall clock, from its
+    first read on. BB_CLOCK_FIX=0 leaves the game this PC's clock."""
+    env.pop('BB_CLOCK_OFFSET_US', None)
+    if env.get('BB_CLOCK_FIX') == '0':
+        say('Clock: the game uses this PC\'s clock as it is (BB_CLOCK_FIX=0)')
+        return
+    measured = time_server_offset()
+    if not measured:
+        say('Clock: no time server answered (UDP 123): the game uses this PC\'s clock as it is')
+        return
+    offset_us, server, rtt = measured
+    env['BB_CLOCK_OFFSET_US'] = str(offset_us)
+    say(f"Clock: this PC's clock is {abs(offset_us) / 1000:.0f} ms {'behind' if offset_us > 0 else 'ahead of'} "
+        f"{server} (round trip {rtt:.0f} ms): the game's clock is corrected by {offset_us / 1000:+.0f} ms")
+
+
 def setup_online(env, config, data):
     # The item-box rules come only from the server (below): items are drawn on each player's PC,
     # so a local setting would let one player pick their own odds.
@@ -534,6 +603,7 @@ def setup_online(env, config, data):
             host = h
             auth_port = p
 
+    setup_game_clock(env)
     env['BB_ONLINE_SERVER'] = host
     env['BB_ONLINE_HTTP_PORT'] = auth_port  # the runtime's own requests (Friends tab)
     env['BB_ONLINE_NAME'] = name

@@ -52,6 +52,35 @@ static int32_t fail_posix(int e) { *runtime_errno()=runtime_guest_errno(e); retu
 static struct timespec process_start;
 __attribute__((constructor)) static void remember_start(void) { clock_gettime(CLOCK_MONOTONIC,&process_start); }
 
+/* The wall clock the game reads is this PC's plus the time servers' offset that run.py measured
+ * just before starting the game (BB_CLOCK_OFFSET_US, microseconds; set from the first read on, so
+ * the game never sees it jump). PS4s keep their clocks network-synced; PCs were seconds apart (the
+ * 2026-11-02 logs: 6 s for one player), and the game's network code reads the wall clock (about
+ * 420 gettimeofday calls a second per connected player). Monotonic clocks and the TSC stay as they
+ * are. */
+int64_t runtime_wall_offset_us(void) {
+    static int64_t offset;
+    static int read;
+    if (!__atomic_load_n(&read,__ATOMIC_ACQUIRE)) {
+        const char *env=getenv("BB_CLOCK_OFFSET_US");
+        long long v=0;
+        int64_t value=0;
+        if (env && sscanf(env,"%lld",&v)==1 && v>-86400000000ll && v<86400000000ll) value=(int64_t)v;
+        __atomic_store_n(&offset,value,__ATOMIC_RELAXED);
+        __atomic_store_n(&read,1,__ATOMIC_RELEASE);
+    }
+    return __atomic_load_n(&offset,__ATOMIC_RELAXED);
+}
+/* A host timespec moved by the wall-clock offset. */
+static void wall_correct(struct timespec *t) {
+    const int64_t off=runtime_wall_offset_us();
+    if (!off) return;
+    int64_t ns=(int64_t)t->tv_nsec+(off%1000000)*1000;
+    int64_t sec=(int64_t)t->tv_sec+off/1000000;
+    if (ns<0) { ns+=1000000000; --sec; } else if (ns>=1000000000) { ns-=1000000000; ++sec; }
+    t->tv_sec=(time_t)sec; t->tv_nsec=(long)ns;
+}
+
 /* The game's clock calls, counted for the network summary (runtime_kernel_clock_take). The port's
  * own uses (the GPU library's timestamps) go through other entry points and are not counted. */
 static RuntimeClockCounts clock_counts;
@@ -105,6 +134,7 @@ static int clock_read(uint32_t id,GuestTimespec *ts) {
     if (!ts || !host_clock(id,&host)) return EINVAL;
     struct timespec t;
     if (clock_gettime(host,&t)) return errno;
+    if (id==0 || id==9 || id==10 || id==13) wall_correct(&t); /* the realtime clocks */
     if (id==13) t.tv_nsec=0;
     ts->sec=t.tv_sec; ts->nsec=t.tv_nsec; return 0;
 }
@@ -227,6 +257,12 @@ static int32_t read_timeofday(GuestTimeval *tv,GuestTimezone *tz,const void *cal
     CLOCK_COUNT(gettimeofday);
     clock_note_caller(0,caller);
     gettimeofday(&t,NULL);
+    const int64_t off=runtime_wall_offset_us();
+    if (off) {
+        int64_t us=(int64_t)t.tv_usec+off%1000000, sec=(int64_t)t.tv_sec+off/1000000;
+        if (us<0) { us+=1000000; --sec; } else if (us>=1000000) { us-=1000000; ++sec; }
+        t.tv_sec=(time_t)sec; t.tv_usec=(long)us;
+    }
     if (tv) { tv->sec=t.tv_sec; tv->usec=t.tv_usec; }
     if (tz) kernel_gettimezone(tz);
     return 0;
@@ -238,7 +274,11 @@ static ABI int32_t kernel_gettimeofday(GuestTimeval *tv) {
     if (!tv) return ERR(22);
     return read_timeofday(tv,NULL,__builtin_return_address(0));
 }
-static ABI int64_t posix_time(int64_t *out) { CLOCK_COUNT(time); int64_t t=(int64_t)time(NULL); if (out) *out=t; return t; }
+static ABI int64_t posix_time(int64_t *out) {
+    CLOCK_COUNT(time);
+    struct timespec now; clock_gettime(CLOCK_REALTIME,&now); wall_correct(&now);
+    int64_t t=(int64_t)now.tv_sec; if (out) *out=t; return t;
+}
 
 /* ---- process ---- */
 static ABI int32_t get_pagesize(void) { return PAGE; }

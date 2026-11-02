@@ -89,7 +89,7 @@ int32_t runtime_net_init(void) {
 #endif
         net_overrides_init();
         g_net_initialized = 1;
-        runtime_net_trace("sceNetInit completed (NET-PATCH v6: peeks kept, per-player summary, one copy per datagram, one player per address, clock and sender diagnostics)");
+        runtime_net_trace("sceNetInit completed (NET-PATCH v7: peeks kept, per-player summary, one copy per datagram, one player per address, corrected wall clock, clock and sender diagnostics)");
         clock_check_start();
     }
     runtime_friends_start();
@@ -1252,8 +1252,10 @@ static void *clock_check(void *arg) {
             int64_t offset = 0, rtt = 0;
             if (!sntp_query(servers[i], &offset, &rtt)) continue;
             const int64_t ahead = -offset; /* this PC minus the server */
-            runtime_net_trace("Clock: this PC's clock is %.0f ms %s %s (round trip %.0f ms)",
-                              (ahead < 0 ? -ahead : ahead) / 1000.0, ahead < 0 ? "behind" : "ahead of", servers[i], rtt / 1000.0);
+            const int64_t game = ahead + runtime_wall_offset_us(); /* the game's clock minus the server */
+            runtime_net_trace("Clock: this PC's clock is %.0f ms %s %s (round trip %.0f ms); the game's clock (corrected by %+.0f ms) is %.0f ms %s",
+                              (ahead < 0 ? -ahead : ahead) / 1000.0, ahead < 0 ? "behind" : "ahead of", servers[i], rtt / 1000.0,
+                              runtime_wall_offset_us() / 1000.0, (game < 0 ? -game : game) / 1000.0, game < 0 ? "behind" : "ahead");
             done = 1;
         }
         if (!done) runtime_net_trace("Clock: no time server answered (UDP 123): this PC's clock offset is unknown");

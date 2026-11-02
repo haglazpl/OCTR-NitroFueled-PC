@@ -115,6 +115,10 @@ typedef struct {
     uint64_t clock_ids; /* bit n: clock_gettime(n) was read */
 } RuntimeClockCounts;
 void runtime_kernel_clock_take(RuntimeClockCounts *out);
+/* Microseconds added to this PC's wall clock wherever the game reads it (gettimeofday, the realtime
+ * clocks, time(), the RTC): the time servers' clock minus this PC's, measured by run.py before the
+ * game starts (BB_CLOCK_OFFSET_US); 0 without it. */
+int64_t runtime_wall_offset_us(void);
 /* The game's code that read the wall clock since the previous take, which resets the counts: kind 0
  * gettimeofday, 1 clock_gettime; their number (at most max). */
 int runtime_clock_callers_take(int *kinds, uintptr_t *callers, uint32_t *counts, int max);
