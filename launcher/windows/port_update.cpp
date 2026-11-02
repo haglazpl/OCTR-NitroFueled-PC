@@ -63,20 +63,40 @@ Version ParseVersion(const std::string& text) {
     if (suffix.empty()) {
         v.stage = 1;
     } else {
-        // git describe: -<commits>-g<hash>
-        size_t j = 0;
-        bool describe = suffix[j] == '-';
-        ++j;
-        const size_t digits = j;
-        while (j < suffix.size() && std::isdigit(static_cast<unsigned char>(suffix[j]))) ++j;
-        describe = describe && j > digits && j + 1 < suffix.size() && suffix[j] == '-' && suffix[j + 1] == 'g';
-        if (describe) {
-            j += 2;
-            const size_t hex = j;
-            while (j < suffix.size() && std::isxdigit(static_cast<unsigned char>(suffix[j]))) ++j;
-            describe = j > hex && j == suffix.size();
+        // Digits at `at` (at most 9): their value, -1 when there are none; `at` moves past them.
+        const auto number = [&suffix](size_t& at) {
+            const size_t start = at;
+            int n = 0;
+            while (at < suffix.size() && at - start < 9 && std::isdigit(static_cast<unsigned char>(suffix[at])))
+                n = n * 10 + (suffix[at++] - '0');
+            return at > start ? n : -1;
+        };
+        // git describe from `at` to the end: -<commits>-g<hash>; *commits set when it is one.
+        const auto describe = [&suffix, &number](size_t at, int* commits) {
+            if (at >= suffix.size() || suffix[at] != '-') return false;
+            ++at;
+            const int n = number(at);
+            if (n < 0 || at + 1 >= suffix.size() || suffix[at] != '-' || suffix[at + 1] != 'g') return false;
+            at += 2;
+            const size_t hex = at;
+            while (at < suffix.size() && std::isxdigit(static_cast<unsigned char>(suffix[at]))) ++at;
+            if (at == hex || at != suffix.size()) return false;
+            *commits = n;
+            return true;
+        };
+        int commits = 0;
+        v.stage = 0;
+        if (describe(0, &commits)) {
+            v.stage = 2;
+        } else if (suffix.compare(0, 4, "-net") == 0) {  // the fork: -net<N>[-<commits>-g<hash>]
+            size_t at = 4;
+            const int build = number(at);
+            if (build > 0 && (at == suffix.size() || describe(at, &commits))) {
+                v.stage = 3;
+                v.build = build;
+                v.commits = commits;
+            }
         }
-        v.stage = describe ? 2 : 0;
     }
     return v;
 }
@@ -86,7 +106,9 @@ bool IsNewer(const Version& a, const Version& b) {
     if (b.major != a.major) return b.major > a.major;
     if (b.minor != a.minor) return b.minor > a.minor;
     if (b.patch != a.patch) return b.patch > a.patch;
-    return b.stage > a.stage;
+    if (b.stage != a.stage) return b.stage > a.stage;
+    if (b.build != a.build) return b.build > a.build;
+    return b.commits > a.commits;
 }
 
 // --- a small JSON reader (the release answer) ----------------------------------------------

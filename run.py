@@ -439,12 +439,14 @@ def server_settings(host, port):
     return settings if isinstance(settings, dict) else {}
 
 
-RELEASES_API = 'https://api.github.com/repos/Ryu7w7/OCTR-NitroFueled-PC/releases/latest'
+# haglazpl's fork: its own releases (v<Ryu7w7's version>-net<N>); the RyuNET server is unchanged.
+RELEASES_API = 'https://api.github.com/repos/haglazpl/OCTR-NitroFueled-PC/releases/latest'
 
 
 def parse_version(text):
     """(major, minor, patch, stage) as the launchers compare versions (launcher/appimage_update.py,
-    launcher/windows/port_update.cpp): stage 0 a pre-release, 1 the release, 2 commits after it."""
+    launcher/windows/port_update.cpp): stage 0 a pre-release, 1 the release, 2 commits after it,
+    3 a fork release (-net<N>, then build N and the commits after it)."""
     m = re.match(r'^\s*[vV]?(\d{1,5})\.(\d{1,5})(?:\.(\d{1,5}))?(.*?)\s*$', text or '')
     if not m:
         return None
@@ -456,8 +458,19 @@ def parse_version(text):
                 break
         else:
             break
-    stage = 1 if not suffix else 2 if re.fullmatch(r'-\d+-g[0-9a-fA-F]+', suffix) else 0
-    return int(m.group(1)), int(m.group(2)), int(m.group(3) or 0), stage
+    build = commits = 0
+    if not suffix:
+        stage = 1
+    elif re.fullmatch(r'-\d+-g[0-9a-fA-F]+', suffix):
+        stage = 2
+    else:
+        # The fork's releases: -net<N> on top of Ryu7w7's version, -net<N>-<n>-g<hash> after one.
+        fork = re.fullmatch(r'-net(\d{1,9})(?:-(\d{1,9})-g[0-9a-fA-F]+)?', suffix)
+        if fork and int(fork.group(1)) > 0:
+            stage, build, commits = 3, int(fork.group(1)), int(fork.group(2) or 0)
+        else:
+            stage = 0
+    return int(m.group(1)), int(m.group(2)), int(m.group(3) or 0), stage, build, commits
 
 
 def update_notice(env, version):
