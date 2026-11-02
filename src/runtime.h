@@ -115,6 +115,9 @@ typedef struct {
     uint64_t clock_ids; /* bit n: clock_gettime(n) was read */
 } RuntimeClockCounts;
 void runtime_kernel_clock_take(RuntimeClockCounts *out);
+/* The game's code that read the wall clock since the previous take, which resets the counts: kind 0
+ * gettimeofday, 1 clock_gettime; their number (at most max). */
+int runtime_clock_callers_take(int *kinds, uintptr_t *callers, uint32_t *counts, int max);
 /* The CPU timer (TSC) frequency the game was given, and the timer's rate measured since that
  * calibration: 0 before the calibration or in its first second. */
 int runtime_tsc_check(uint64_t *given_hz, double *measured_hz, double *seconds);

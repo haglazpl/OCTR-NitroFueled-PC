@@ -66,6 +66,27 @@ void runtime_kernel_clock_take(RuntimeClockCounts *out) {
     out->time=__atomic_exchange_n(&clock_counts.time,0,__ATOMIC_RELAXED);
     out->clock_ids=__atomic_exchange_n(&clock_counts.clock_ids,0,__ATOMIC_RELAXED);
 }
+/* Which of the game's code reads gettimeofday (kind 0) and clock_gettime (kind 1), up to 12 places. */
+static struct { int kind; uintptr_t caller; uint32_t count; } clock_callers[12];
+static atomic_flag clock_callers_lock = ATOMIC_FLAG_INIT;
+static void clock_note_caller(int kind,const void *caller) {
+    while (atomic_flag_test_and_set_explicit(&clock_callers_lock,memory_order_acquire)) {}
+    for (int i=0;i<12;++i) {
+        if (!clock_callers[i].caller) { clock_callers[i].kind=kind; clock_callers[i].caller=(uintptr_t)caller; }
+        if (clock_callers[i].kind==kind && clock_callers[i].caller==(uintptr_t)caller) { clock_callers[i].count++; break; }
+    }
+    atomic_flag_clear_explicit(&clock_callers_lock,memory_order_release);
+}
+int runtime_clock_callers_take(int *kinds,uintptr_t *callers,uint32_t *counts,int max) {
+    int n=0;
+    while (atomic_flag_test_and_set_explicit(&clock_callers_lock,memory_order_acquire)) {}
+    for (int i=0;i<12;++i) {
+        if (clock_callers[i].count && n<max) { kinds[n]=clock_callers[i].kind; callers[n]=clock_callers[i].caller; counts[n]=clock_callers[i].count; ++n; }
+        clock_callers[i].count=0;
+    }
+    atomic_flag_clear_explicit(&clock_callers_lock,memory_order_release);
+    return n;
+}
 static int host_clock(uint32_t id,clockid_t *out) {
     switch (id) {
     case 0: case 9: case 10: *out=CLOCK_REALTIME; return 1;            /* REALTIME(_PRECISE/_FAST) */
@@ -88,9 +109,11 @@ static int clock_read(uint32_t id,GuestTimespec *ts) {
     ts->sec=t.tv_sec; ts->nsec=t.tv_nsec; return 0;
 }
 static ABI int32_t kernel_clock_gettime(uint32_t id,GuestTimespec *ts) {
+    clock_note_caller(1,__builtin_return_address(0));
     int e=clock_read(id,ts); return e ? ERR(runtime_guest_errno(e)) : 0;
 }
 static ABI int32_t posix_clock_gettime(uint32_t id,GuestTimespec *ts) {
+    clock_note_caller(1,__builtin_return_address(0));
     int e=clock_read(id,ts); return e ? fail_posix(e) : 0;
 }
 static ABI int32_t posix_clock_getres(uint32_t id,GuestTimespec *ts) {
@@ -199,17 +222,21 @@ static ABI int32_t kernel_gettimezone(GuestTimezone *tz) {
 #endif
     return 0;
 }
-static ABI int32_t posix_gettimeofday(GuestTimeval *tv,GuestTimezone *tz) {
+static int32_t read_timeofday(GuestTimeval *tv,GuestTimezone *tz,const void *caller) {
     struct timeval t;
     CLOCK_COUNT(gettimeofday);
+    clock_note_caller(0,caller);
     gettimeofday(&t,NULL);
     if (tv) { tv->sec=t.tv_sec; tv->usec=t.tv_usec; }
     if (tz) kernel_gettimezone(tz);
     return 0;
 }
+static ABI int32_t posix_gettimeofday(GuestTimeval *tv,GuestTimezone *tz) {
+    return read_timeofday(tv,tz,__builtin_return_address(0));
+}
 static ABI int32_t kernel_gettimeofday(GuestTimeval *tv) {
     if (!tv) return ERR(22);
-    return posix_gettimeofday(tv,NULL);
+    return read_timeofday(tv,NULL,__builtin_return_address(0));
 }
 static ABI int64_t posix_time(int64_t *out) { CLOCK_COUNT(time); int64_t t=(int64_t)time(NULL); if (out) *out=t; return t; }
 

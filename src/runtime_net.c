@@ -89,7 +89,7 @@ int32_t runtime_net_init(void) {
 #endif
         net_overrides_init();
         g_net_initialized = 1;
-        runtime_net_trace("sceNetInit completed (NET-PATCH v5: peeks kept, per-player summary, one copy per datagram, clock and sender diagnostics)");
+        runtime_net_trace("sceNetInit completed (NET-PATCH v6: peeks kept, per-player summary, one copy per datagram, one player per address, clock and sender diagnostics)");
         clock_check_start();
     }
     runtime_friends_start();
@@ -688,10 +688,22 @@ static char *upnp_rewrite(const void *msg, size_t len) {
  * The game must see it once, so a copy is dropped when the same bytes already came from that peer
  * by another path within MP_WINDOW_MS. Counting per path keeps the game's own repeats (a resend
  * after a lost ack comes by every path again): each of those still reaches the game once.
- * BB_NET_MULTIPATH_DEDUP=0 turns it off. */
+ * BB_NET_MULTIPATH_DEDUP=0 turns the dropping off.
+ *
+ * A player's tunnelled copies can also carry another port than its direct packets: its router sends
+ * to the relay from another external port than the one UPnP gave it (CWL63 in the 2026-11-02 logs:
+ * direct from :3080, relayed from :3074, for the whole session). The game then saw a second,
+ * unknown player, and the RyuNET ping answered that one through the tunnel, which kept telling the
+ * player's PC that the direct path did not work (it copied every packet all session). So when a
+ * tunnelled datagram has the same bytes as one that came direct from another port of the same
+ * address, it is that player's: its port is taken (tunnel_alias), and kept for MP_ALIAS_MS after
+ * each match. A port that sends direct packets itself is never taken for another. */
 #define MP_PEERS 16
 #define MP_RING 128
 #define MP_WINDOW_MS 1500u
+#define MP_ALIASES 8
+#define MP_ALIAS_MS 10000u
+#define MP_DIRECT_FRESH_MS 3000u
 
 typedef struct {
     uint64_t hash;
@@ -701,14 +713,22 @@ typedef struct {
 
 typedef struct {
     uint32_t ip;
-    uint16_t port;
+    uint16_t port; /* network order */
     int used;
     uint64_t last_use;
+    uint64_t last_direct; /* when a datagram last came from it directly */
     uint32_t head;
     MpEntry e[MP_RING];
 } MpPeer;
 
+typedef struct {
+    uint32_t ip;
+    uint16_t from, to; /* network order */
+    uint64_t at;       /* the latest match */
+} MpAlias;
+
 static MpPeer g_mp[MP_PEERS];
+static MpAlias g_mp_alias[MP_ALIASES];
 static uint32_t g_mp_dropped;
 static atomic_flag g_mp_lock = ATOMIC_FLAG_INIT;
 
@@ -721,40 +741,102 @@ static int multipath_enabled(void) {
     return on;
 }
 
-/* 1 when this datagram is a copy of one the game already got from this peer by another path. */
-static int multipath_copy(const struct sockaddr_in *from, const uint8_t *data, int len, int route) {
-    if (len <= 0 || !multipath_enabled()) return 0;
-    const int path = route == TUN_VIA_RELAY ? 1 : route == TUN_VIA_SERVER ? 2 : 0;
+static uint64_t payload_hash(const uint8_t *data, int len) {
     uint64_t h = 14695981039346656037ULL ^ (uint64_t)len;
     for (int i = 0; i < len; i++) {
         h ^= data[i];
         h *= 1099511628211ULL;
     }
-    const uint32_t ip = from->sin_addr.s_addr;
-    const uint16_t port = from->sin_port;
+    return h;
+}
+
+/* This peer's entry (made, in a free or the idlest slot, with create). Holds the lock. */
+static MpPeer *mp_peer(uint32_t ip, uint16_t port, uint64_t now, int create) {
+    MpPeer *free_slot = NULL, *idlest = NULL;
+    for (int i = 0; i < MP_PEERS; i++) {
+        MpPeer *p = &g_mp[i];
+        if (p->used && p->ip == ip && p->port == port) return p;
+        if (!p->used || now - p->last_use > 60000u) {
+            if (!free_slot) free_slot = p;
+        } else if (!idlest || p->last_use < idlest->last_use) {
+            idlest = p;
+        }
+    }
+    if (!create) return NULL;
+    MpPeer *p = free_slot ? free_slot : idlest;
+    memset(p, 0, sizeof(*p));
+    p->used = 1;
+    p->ip = ip;
+    p->port = port;
+    return p;
+}
+
+/* The recent entry of these bytes. Holds the lock. */
+static MpEntry *mp_find(MpPeer *p, uint64_t h, uint64_t now) {
+    for (int i = 0; i < MP_RING; i++) {
+        MpEntry *c = &p->e[i];
+        if (c->at && c->hash == h && now - c->at <= MP_WINDOW_MS) return c;
+    }
+    return NULL;
+}
+
+/* A tunnelled datagram from ip:port (port in host order) with these bytes: the port it is taken
+ * from (another port of the same address when it is that player's, see above). */
+static uint16_t tunnel_alias(uint32_t ip, uint16_t port, const uint8_t *data, int len) {
+    if (len <= 0) return port;
+    const uint16_t from = htons(port);
+    const uint64_t now = now_ms(), h = payload_hash(data, len);
+    uint16_t to = 0;
+    int announce = 0;
+    while (atomic_flag_test_and_set_explicit(&g_mp_lock, memory_order_acquire)) {}
+    const MpPeer *self = mp_peer(ip, from, now, 0);
+    if (!self || !self->last_direct || now - self->last_direct >= MP_DIRECT_FRESH_MS) {
+        for (int i = 0; i < MP_PEERS && !to; i++) {
+            MpPeer *p = &g_mp[i];
+            if (!p->used || p->ip != ip || p->port == from || !p->last_direct ||
+                now - p->last_direct >= MP_DIRECT_FRESH_MS)
+                continue;
+            const MpEntry *e = mp_find(p, h, now);
+            if (e && e->count[0]) to = p->port;
+        }
+        MpAlias *slot = NULL, *oldest = NULL;
+        for (int i = 0; i < MP_ALIASES && !slot; i++) {
+            MpAlias *a = &g_mp_alias[i];
+            if (a->at && a->ip == ip && a->from == from) slot = a;
+            else if (!oldest || a->at < oldest->at) oldest = a;
+        }
+        if (to) {
+            announce = !slot || slot->to != to || now - slot->at >= MP_ALIAS_MS;
+            if (!slot) slot = oldest;
+            slot->ip = ip;
+            slot->from = from;
+            slot->to = to;
+            slot->at = now;
+        } else if (slot && now - slot->at < MP_ALIAS_MS) {
+            to = slot->to;
+        }
+    }
+    atomic_flag_clear_explicit(&g_mp_lock, memory_order_release);
+    if (announce) {
+        const uint8_t *b = (const uint8_t *)&ip;
+        runtime_net_trace("Tunnel: %u.%u.%u.%u's tunnelled packets come from port %u, its direct ones from %u: the same player",
+                          b[0], b[1], b[2], b[3], port, ntohs(to));
+    }
+    return to ? ntohs(to) : port;
+}
+
+/* 1 when this datagram is a copy of one the game already got from this peer by another path. */
+static int multipath_copy(const struct sockaddr_in *from, const uint8_t *data, int len, int route) {
+    if (len <= 0) return 0;
+    const int path = route == TUN_VIA_RELAY ? 1 : route == TUN_VIA_SERVER ? 2 : 0;
+    const uint64_t h = payload_hash(data, len);
     const uint64_t now = now_ms();
     int drop = 0;
     while (atomic_flag_test_and_set_explicit(&g_mp_lock, memory_order_acquire)) {}
-    MpPeer *peer = NULL, *free_slot = NULL, *idlest = NULL;
-    for (int i = 0; i < MP_PEERS && !peer; i++) {
-        MpPeer *p = &g_mp[i];
-        if (p->used && p->ip == ip && p->port == port) peer = p;
-        else if (!p->used || now - p->last_use > 60000u) { if (!free_slot) free_slot = p; }
-        else if (!idlest || p->last_use < idlest->last_use) idlest = p;
-    }
-    if (!peer) {
-        peer = free_slot ? free_slot : idlest;
-        memset(peer, 0, sizeof(*peer));
-        peer->used = 1;
-        peer->ip = ip;
-        peer->port = port;
-    }
+    MpPeer *peer = mp_peer(from->sin_addr.s_addr, from->sin_port, now, 1);
     peer->last_use = now;
-    MpEntry *e = NULL;
-    for (int i = 0; i < MP_RING && !e; i++) {
-        MpEntry *c = &peer->e[i];
-        if (c->at && c->hash == h && now - c->at <= MP_WINDOW_MS) e = c;
-    }
+    if (path == 0) peer->last_direct = now;
+    MpEntry *e = mp_find(peer, h, now);
     if (!e) {
         e = &peer->e[peer->head++ % MP_RING];
         memset(e, 0, sizeof(*e));
@@ -765,7 +847,7 @@ static int multipath_copy(const struct sockaddr_in *from, const uint8_t *data, i
     int others = 0;
     for (int k = 0; k < 3; k++)
         if (k != path && e->count[k] > others) others = e->count[k];
-    drop = e->count[path] <= others;
+    drop = multipath_enabled() && e->count[path] <= others;
     atomic_flag_clear_explicit(&g_mp_lock, memory_order_release);
     if (drop) __atomic_add_fetch(&g_mp_dropped, 1, __ATOMIC_RELAXED);
     return drop;
@@ -1069,6 +1151,21 @@ static void report_clocks(double secs) {
                       network / secs, who, current / secs, c.tsc_reads / secs, c.tsc_frequency / secs,
                       c.process_time / secs, c.process_counter / secs, c.clock_gettime / secs, ids[0] ? ids : "-",
                       c.gettimeofday / secs, c.time / secs);
+    int kinds[12];
+    uintptr_t where_from[12];
+    uint32_t calls[12];
+    const int nw = runtime_clock_callers_take(kinds, where_from, calls, 12);
+    if (nw) {
+        char list[640];
+        size_t used = 0;
+        for (int i = 0; i < nw && used < sizeof(list) - 64; i++) {
+            char where[40];
+            code_where(where_from[i], where, sizeof(where));
+            used += (size_t)snprintf(list + used, sizeof(list) - used, "%s%s %s x%u", i ? ", " : "",
+                                     kinds[i] ? "clock_gettime" : "gettimeofday", where, calls[i]);
+        }
+        runtime_net_trace("Net   clock callers: %s", list);
+    }
     uint64_t given;
     double measured, over;
     if (runtime_tsc_check(&given, &measured, &over)) {
@@ -1399,6 +1496,7 @@ next_datagram: /* after a tunnel control packet, which is not the game's */
             if (tun_on_offer(wrapped, (size_t)ret, now_ms())) goto next_datagram;
             /* The server's own NAT replies (0x15, 0x1F, 0x0B...) go to the game unchanged. */
             if (tun_unwrap(wrapped, (size_t)ret, &tflags, &ip, &port)) {
+                port = tunnel_alias(ip, port, wrapped + TUN_HEADER_LEN, ret - TUN_HEADER_LEN);
                 tun_on_tunnelled(ip, port, tflags, 0, now_ms());
                 if (tflags & TUN_FLAG_PING) ping_on_capable(ip, port, now_ms());
                 sin.sin_addr.s_addr = ip;
@@ -1414,6 +1512,7 @@ next_datagram: /* after a tunnel control packet, which is not the game's */
                 tun_on_register_reply(relay, wrapped, (size_t)ret, now_ms());
                 goto next_datagram;
             }
+            port = tunnel_alias(ip, port, wrapped + TUN_HEADER_LEN, ret - TUN_HEADER_LEN);
             tun_on_tunnelled(ip, port, tflags, 1, now_ms());
             if (tflags & TUN_FLAG_PING) ping_on_capable(ip, port, now_ms());
             sin.sin_addr.s_addr = ip;
