@@ -89,7 +89,7 @@ int32_t runtime_net_init(void) {
 #endif
         net_overrides_init();
         g_net_initialized = 1;
-        runtime_net_trace("sceNetInit completed (NET-PATCH v9: peeks kept, per-player summary, one copy per datagram, one player per address, corrected and slewed wall clock, clock, sender and send-chain (stack scan) diagnostics)");
+        runtime_net_trace("sceNetInit completed (NET-PATCH v10: peeks kept, per-player summary, one copy per datagram, one player per address, corrected and slewed wall clock, clock, sender and send-chain diagnostics (BB_NET_SEND_CHAINS=1))");
         clock_check_start();
     }
     runtime_friends_start();
@@ -1071,6 +1071,31 @@ void runtime_net_set_image(const unsigned char *image, size_t size) {
     g_image_size = size;
 }
 
+/* The image's executable segments (probe.c): the image also has gaps the port keeps unreadable, and
+ * net7's scan read the bytes before a stack word pointing into one (the game's network thread
+ * crashed, 2026-11-02 23:41). Code bytes are only read inside these. */
+#define CODE_RANGES_MAX 16
+static uintptr_t g_code_lo[CODE_RANGES_MAX], g_code_hi[CODE_RANGES_MAX];
+static int g_code_ranges;
+
+void runtime_net_add_code(const unsigned char *start, size_t size) {
+    if (g_code_ranges < CODE_RANGES_MAX && start && size) {
+        g_code_lo[g_code_ranges] = (uintptr_t)start;
+        g_code_hi[g_code_ranges] = (uintptr_t)start + size;
+        g_code_ranges++;
+    }
+}
+
+/* The send-chain scan runs only with BB_NET_SEND_CHAINS=1 (a diagnostic session). */
+static int send_chains_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("BB_NET_SEND_CHAINS");
+        on = v && strcmp(v, "1") == 0;
+    }
+    return on;
+}
+
 /* "game +0x..." for an address in the game's image, the address itself otherwise. */
 static void code_where(uintptr_t address, char *out, size_t cap) {
     if (g_image && address >= (uintptr_t)g_image && address < (uintptr_t)g_image + g_image_size)
@@ -1121,10 +1146,13 @@ static int stack_end(uintptr_t here, uintptr_t *end) {
 #endif
 }
 
-/* A return address into the game: in the image, just after a call instruction. */
+/* A return address into the game: inside one of its executable segments (so the bytes before it
+ * are readable code), just after a call instruction. */
 static int game_return(uintptr_t w) {
-    const uintptr_t lo = (uintptr_t)g_image, hi = (uintptr_t)g_image + g_image_size;
-    if (w < lo + 8 || w >= hi) return 0;
+    int inside = 0;
+    for (int i = 0; i < g_code_ranges && !inside; i++)
+        inside = w >= g_code_lo[i] + 8 && w <= g_code_hi[i];
+    if (!inside) return 0;
     const uint8_t *p = (const uint8_t *)w;
     if (p[-5] == 0xe8) return 1;                                   /* call rel32 */
     if (p[-6] == 0xff && (p[-5] & 0x38) == 0x10) return 1;         /* call [rip+disp32] / [reg+disp32] */
@@ -1205,10 +1233,13 @@ static void sendsite_on_send(const void *caller, const void *frame, const struct
     if (!caller || !netstat_interval() || !tunnel_server(&server) || to->sin_addr.s_addr == server.sin_addr.s_addr) return;
     const uint64_t now = now_ms();
     uintptr_t chain[STACK_DEPTH];
-    chain[0] = (uintptr_t)caller;
-    const int depth = 1 + guest_chain(frame, (uintptr_t)caller, chain + 1, STACK_DEPTH - 1);
+    int depth = 0;
+    if (send_chains_enabled()) {
+        chain[0] = (uintptr_t)caller;
+        depth = 1 + guest_chain(frame, (uintptr_t)caller, chain + 1, STACK_DEPTH - 1);
+    }
     while (atomic_flag_test_and_set_explicit(&g_sendsite_lock, memory_order_acquire)) {}
-    stack_note(chain, depth);
+    if (depth) stack_note(chain, depth);
     SendSite *s = NULL;
     for (int i = 0; i < SENDSITE_MAX && !s; i++)
         if (!g_sendsites[i].caller || g_sendsites[i].caller == (uintptr_t)caller) s = &g_sendsites[i];

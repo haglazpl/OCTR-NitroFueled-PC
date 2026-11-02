@@ -1231,6 +1231,8 @@ int main(int argc, char **argv) {
     if (!runtime_online_mode_start(image, size)) fail("native Online mode callback could not be installed");
     if (!runtime_itemless_start(image, size)) fail("native Itemless collision callback could not be installed");
     runtime_net_set_image(image, size);
+    for (uint64_t i = 0; i < ns; ++i)
+        if (segments[i].flags & 1) runtime_net_add_code(image + segments[i].address, segments[i].size);
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};

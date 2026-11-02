@@ -137,6 +137,8 @@ int runtime_rtc_clock_take(uint64_t *network_ticks, uint64_t *current_ticks, uin
                            uint32_t *counts, int max);
 /* The game's image, for printing its code addresses as offsets (runtime_net.c). */
 void runtime_net_set_image(const unsigned char *image, size_t size);
+/* One of the image's executable segments: the only memory the send-chain scan reads code bytes from. */
+void runtime_net_add_code(const unsigned char *start, size_t size);
 /* SacredFire online: the running game's title id for the PSN data (runtime_services.c). */
 void runtime_np_set_title(const char *title_id);
 void runtime_file_report(void);
