@@ -89,7 +89,7 @@ int32_t runtime_net_init(void) {
 #endif
         net_overrides_init();
         g_net_initialized = 1;
-        runtime_net_trace("sceNetInit completed (NET-PATCH v10: peeks kept, per-player summary, one copy per datagram, one player per address, corrected and slewed wall clock, clock, sender and send-chain diagnostics (BB_NET_SEND_CHAINS=1))");
+        runtime_net_trace("sceNetInit completed (NET-PATCH v11: peeks kept, per-player summary, one copy per datagram, one player per address, corrected and slewed wall clock, clock, sender threads and send chains by the game's frame pointers (BB_NET_SEND_CHAINS=0 turns them off))");
         clock_check_start();
     }
     runtime_friends_start();
@@ -1059,6 +1059,7 @@ typedef struct {
     uint32_t packets, bytes, max_len, rounds, gap_min, gap_max;
     uint64_t gap_sum;
     uint64_t last_send, round_start;
+    char thread[24];
 } SendSite;
 
 static SendSite g_sendsites[SENDSITE_MAX];
@@ -1086,12 +1087,13 @@ void runtime_net_add_code(const unsigned char *start, size_t size) {
     }
 }
 
-/* The send-chain scan runs only with BB_NET_SEND_CHAINS=1 (a diagnostic session). */
+/* Send chains are on unless BB_NET_SEND_CHAINS=0: the walk reads only this thread's stack and the
+ * game's code, a few words per send. */
 static int send_chains_enabled(void) {
     static int on = -1;
     if (on < 0) {
         const char *v = getenv("BB_NET_SEND_CHAINS");
-        on = v && strcmp(v, "1") == 0;
+        on = !(v && strcmp(v, "0") == 0);
     }
     return on;
 }
@@ -1104,24 +1106,24 @@ static void code_where(uintptr_t address, char *out, size_t cap) {
         snprintf(out, cap, "0x%llx", (unsigned long long)address);
 }
 
-/* The call chain of each send to a player: the return addresses into the game's code above this
- * call on its stack, found by scanning the stack (as profilers do) rather than by following frame
- * pointers, which 64-bit Windows code may keep at an offset inside its frames (net6's frame walk
- * stopped at the first frame there). A stack word counts when it points into the game image just
- * after a call instruction (call rel32, call [rip+disp32], call reg, call [reg+disp]); the scan
- * stays inside this thread's committed stack (VirtualQuery) and 64 KiB. A stale return address
- * left in a frame's locals can show up too, so a chain is a strong hint, not a proof. Each
- * distinct chain is logged once in full and then counted per summary: the way from the game's
- * network update to sendto, to find what paces it (~13 rounds a second). */
+/* The call chain of each send to a player, by the game's own frame pointers: the game's code keeps
+ * them (every function starts push rbp; mov rbp,rsp), and sceNetSendto's entry stub hands over the
+ * game's rbp as it was at the call, before any of the port's (Windows) frames. Each frame holds the
+ * caller's rbp and then the return address; the walk follows them up this thread's stack while
+ * each return address points into the game's code just after a call. A function built without a
+ * frame is skipped, nothing else is guessed (net7's stack scan also caught stale words). Each
+ * distinct chain is logged once in full, with the thread that sent it, and then counted per
+ * summary: the way from the game's network update to sendto, to find what paces it (~13 rounds a
+ * second). */
 #define STACK_DEPTH 16
 #define STACKS_MAX 16
-#define STACK_SCAN_BYTES 65536u
 
 typedef struct {
     uint64_t hash;
     uint32_t count;
     int depth, printed;
     uintptr_t ret[STACK_DEPTH];
+    char thread[24];
 } SendStack;
 
 static SendStack g_stacks[STACKS_MAX];
@@ -1161,29 +1163,27 @@ static int game_return(uintptr_t w) {
     return 0;
 }
 
-/* The game's return addresses above start (the frame of the function the game called; this frame
- * when there is none), at most max, each once; skip (the sender, already first) is left out. */
-static int guest_chain(const void *start, uintptr_t skip, uintptr_t *out, int max) {
+/* The game's return addresses from the frame at rbp up, at most max; skip (the sender, already
+ * first) is left out. */
+static int guest_chain(uintptr_t rbp, uintptr_t skip, uintptr_t *out, int max) {
     volatile uintptr_t marker = 0;
-    uintptr_t here = ((uintptr_t)&marker + 7) & ~(uintptr_t)7;
+    const uintptr_t here = (uintptr_t)&marker;
     uintptr_t end;
-    if (!g_image || !stack_end(here, &end)) return 0;
-    const uintptr_t from = ((uintptr_t)start + 7) & ~(uintptr_t)7;
-    if (start && from > here && from < end) here = from; /* above the port's own frames */
-    if (end - here > STACK_SCAN_BYTES) end = here + STACK_SCAN_BYTES;
+    if (!g_image || !rbp || !stack_end(here, &end)) return 0;
     int n = 0;
-    for (uintptr_t at = here; at + 8 <= end && n < max; at += 8) {
-        const uintptr_t w = *(const uintptr_t *)at;
-        if (!game_return(w) || w == skip) continue;
-        int seen = 0;
-        for (int k = 0; k < n && !seen; k++) seen = out[k] == w;
-        if (!seen) out[n++] = w;
+    while (n < max && !(rbp & 7) && rbp > here && rbp + 16 <= end) {
+        const uintptr_t next = ((const uintptr_t *)rbp)[0];
+        const uintptr_t ret = ((const uintptr_t *)rbp)[1];
+        if (!game_return(ret)) break;
+        if (ret != skip) out[n++] = ret;
+        if (next <= rbp) break;
+        rbp = next;
     }
     return n;
 }
 
 /* Holds g_sendsite_lock. */
-static void stack_note(const uintptr_t *ret, int depth) {
+static void stack_note(const uintptr_t *ret, int depth, const char *thread) {
     uint64_t h = 14695981039346656037ULL ^ (uint64_t)depth;
     for (int i = 0; i < depth; i++) {
         h ^= ret[i];
@@ -1197,6 +1197,7 @@ static void stack_note(const uintptr_t *ret, int depth) {
         slot->hash = h;
         slot->depth = depth;
         memcpy(slot->ret, ret, sizeof(*ret) * (size_t)depth);
+        snprintf(slot->thread, sizeof(slot->thread), "%s", thread);
     }
     slot->count++;
 }
@@ -1214,7 +1215,7 @@ static void report_stacks(void) {
         atomic_flag_clear_explicit(&g_sendsite_lock, memory_order_release);
         if (!s.depth || !s.count) continue;
         if (!s.printed) {
-            size_t at = (size_t)snprintf(line, sizeof(line), "Net   send chain #%d:", i + 1);
+            size_t at = (size_t)snprintf(line, sizeof(line), "Net   send chain #%d (thread %s):", i + 1, s.thread);
             for (int k = 0; k < s.depth && at < sizeof(line) - 40; k++) {
                 char where[40];
                 code_where(s.ret[k], where, sizeof(where));
@@ -1228,7 +1229,7 @@ static void report_stacks(void) {
     if (used) runtime_net_trace("Net   send chains: %s", counts);
 }
 
-static void sendsite_on_send(const void *caller, const void *frame, const struct sockaddr_in *to, size_t len) {
+static void sendsite_on_send(const void *caller, uintptr_t guest_rbp, const struct sockaddr_in *to, size_t len) {
     struct sockaddr_in server;
     if (!caller || !netstat_interval() || !tunnel_server(&server) || to->sin_addr.s_addr == server.sin_addr.s_addr) return;
     const uint64_t now = now_ms();
@@ -1236,15 +1237,18 @@ static void sendsite_on_send(const void *caller, const void *frame, const struct
     int depth = 0;
     if (send_chains_enabled()) {
         chain[0] = (uintptr_t)caller;
-        depth = 1 + guest_chain(frame, (uintptr_t)caller, chain + 1, STACK_DEPTH - 1);
+        depth = 1 + guest_chain(guest_rbp, (uintptr_t)caller, chain + 1, STACK_DEPTH - 1);
     }
+    const char *thread = runtime_thread_current_name();
+    if (!thread) thread = "host";
     while (atomic_flag_test_and_set_explicit(&g_sendsite_lock, memory_order_acquire)) {}
-    if (depth) stack_note(chain, depth);
+    if (depth) stack_note(chain, depth, thread);
     SendSite *s = NULL;
     for (int i = 0; i < SENDSITE_MAX && !s; i++)
         if (!g_sendsites[i].caller || g_sendsites[i].caller == (uintptr_t)caller) s = &g_sendsites[i];
     if (s) {
         s->caller = (uintptr_t)caller;
+        if (!s->thread[0]) snprintf(s->thread, sizeof(s->thread), "%s", thread);
         s->packets++;
         s->bytes += (uint32_t)len;
         if (len > s->max_len) s->max_len = (uint32_t)len;
@@ -1280,8 +1284,8 @@ static void report_senders(double secs) {
         const SendSite *s = &snap[i];
         char where[40];
         code_where(s->caller, where, sizeof(where));
-        runtime_net_trace("Net   sender %-18s %u packets (%.0f/s), avg %u B, max %u B | %u rounds (%.1f/s), every %u-%u ms (avg %.0f ms)",
-                          where, s->packets, s->packets / secs, s->bytes / s->packets, s->max_len, s->rounds,
+        runtime_net_trace("Net   sender %-18s (thread %s) %u packets (%.0f/s), avg %u B, max %u B | %u rounds (%.1f/s), every %u-%u ms (avg %.0f ms)",
+                          where, s->thread, s->packets, s->packets / secs, s->bytes / s->packets, s->max_len, s->rounds,
                           s->rounds / secs, s->gap_min, s->gap_max, s->rounds ? (double)s->gap_sum / s->rounds : 0.0);
     }
 }
@@ -1542,11 +1546,11 @@ int32_t runtime_net_send(int s, const void *msg, size_t len, int flags) {
 }
 
 int32_t runtime_net_sendto(int s, const void *msg, size_t len, int flags, const OrbisNetSockaddr *to, uint32_t tolen) {
-    return runtime_net_sendto_from(s, msg, len, flags, to, tolen, NULL, NULL);
+    return runtime_net_sendto_from(s, msg, len, flags, to, tolen, NULL, 0);
 }
 
 int32_t runtime_net_sendto_from(int s, const void *msg, size_t len, int flags, const OrbisNetSockaddr *to, uint32_t tolen,
-                                const void *caller, const void *frame) {
+                                const void *caller, uintptr_t guest_rbp) {
     (void)tolen;
     VSocket *vs = vsocket_get(s);
     if (!vs) return ORBIS_NET_EBADF;
@@ -1583,7 +1587,7 @@ int32_t runtime_net_sendto_from(int s, const void *msg, size_t len, int flags, c
     if (to && vs->tunnel) {
         const int route = tunnel_copy(vs, msg, len, &sin);
         netstat_on_send(&sin, len, route);
-        sendsite_on_send(caller, frame, &sin, len);
+        sendsite_on_send(caller, guest_rbp, &sin, len);
         ping_after_send(vs, &sin);
         netstat_maybe_report();
     }
