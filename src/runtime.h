@@ -108,6 +108,22 @@ void runtime_room_mode_joined(const char *session_id);
 void runtime_room_mode_left(void);
 int runtime_speed_race_active(void);
 int runtime_itemless_start(unsigned char *image, size_t size);
+/* Clock use by the game, for the network summary's diagnostics (runtime_kernel.c, runtime_rtc.c):
+ * counts of the game's calls since the previous take, which resets them. */
+typedef struct {
+    uint64_t tsc_reads, tsc_frequency, process_time, process_counter, clock_gettime, gettimeofday, time;
+    uint64_t clock_ids; /* bit n: clock_gettime(n) was read */
+} RuntimeClockCounts;
+void runtime_kernel_clock_take(RuntimeClockCounts *out);
+/* The CPU timer (TSC) frequency the game was given, and the timer's rate measured since that
+ * calibration: 0 before the calibration or in its first second. */
+int runtime_tsc_check(uint64_t *given_hz, double *measured_hz, double *seconds);
+/* sceRtcGetCurrentNetworkTick and sceRtcGetCurrentTick calls since the previous take, and up to
+ * max distinct callers of the network tick with their counts: their number. */
+int runtime_rtc_clock_take(uint64_t *network_ticks, uint64_t *current_ticks, uintptr_t *callers,
+                           uint32_t *counts, int max);
+/* The game's image, for printing its code addresses as offsets (runtime_net.c). */
+void runtime_net_set_image(const unsigned char *image, size_t size);
 /* SacredFire online: the running game's title id for the PSN data (runtime_services.c). */
 void runtime_np_set_title(const char *title_id);
 void runtime_file_report(void);

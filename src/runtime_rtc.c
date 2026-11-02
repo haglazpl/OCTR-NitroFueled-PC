@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <stdatomic.h>
 
 #define ERR_INVALID_POINTER ((int32_t)0x80B50002)
 #define ERR_INVALID_YEAR ((int32_t)0x80B50008)
@@ -89,7 +90,43 @@ static ABI int32_t rtc_current_clock(DateTime *t, int32_t minutes) {
     from_tick((uint64_t)((int64_t)now_utc()+(int64_t)minutes*60000000),t);
     return 0;
 }
-static ABI int32_t rtc_current_tick(uint64_t *tick) { if (!tick) return ERR_INVALID_POINTER; *tick=now_utc(); return 0; }
+/* The game's reads of "now" as a tick, counted for the network summary (runtime_rtc_clock_take). On
+ * a PS4 the network tick is a time all consoles share; here, as the current tick, it is this PC's
+ * clock. Its callers are kept (up to 8) to find where the game uses it. */
+static uint64_t current_tick_calls, network_tick_calls;
+static uintptr_t network_tick_callers[8];
+static uint32_t network_tick_caller_calls[8];
+static atomic_flag network_tick_lock = ATOMIC_FLAG_INIT;
+static ABI int32_t rtc_current_tick(uint64_t *tick) {
+    if (!tick) return ERR_INVALID_POINTER;
+    __atomic_add_fetch(&current_tick_calls,1,__ATOMIC_RELAXED);
+    *tick=now_utc(); return 0;
+}
+static ABI int32_t rtc_network_tick(uint64_t *tick) {
+    if (!tick) return ERR_INVALID_POINTER;
+    *tick=now_utc();
+    __atomic_add_fetch(&network_tick_calls,1,__ATOMIC_RELAXED);
+    const uintptr_t caller=(uintptr_t)__builtin_return_address(0);
+    while (atomic_flag_test_and_set_explicit(&network_tick_lock,memory_order_acquire)) {}
+    int i=0;
+    while (i<8 && network_tick_callers[i] && network_tick_callers[i]!=caller) ++i;
+    if (i<8) { network_tick_callers[i]=caller; network_tick_caller_calls[i]++; }
+    atomic_flag_clear_explicit(&network_tick_lock,memory_order_release);
+    return 0;
+}
+int runtime_rtc_clock_take(uint64_t *network_ticks, uint64_t *current_ticks, uintptr_t *callers,
+                           uint32_t *counts, int max) {
+    *network_ticks=__atomic_exchange_n(&network_tick_calls,0,__ATOMIC_RELAXED);
+    *current_ticks=__atomic_exchange_n(&current_tick_calls,0,__ATOMIC_RELAXED);
+    int n=0;
+    while (atomic_flag_test_and_set_explicit(&network_tick_lock,memory_order_acquire)) {}
+    for (int i=0;i<8;++i) {
+        if (network_tick_caller_calls[i] && n<max) { callers[n]=network_tick_callers[i]; counts[n]=network_tick_caller_calls[i]; ++n; }
+        network_tick_caller_calls[i]=0;
+    }
+    atomic_flag_clear_explicit(&network_tick_lock,memory_order_release);
+    return n;
+}
 static ABI int32_t rtc_utc_to_local(const uint64_t *utc, uint64_t *local) {
     if (!utc || !local) return ERR_INVALID_POINTER;
     *local=(uint64_t)((int64_t)*utc+local_offset(*utc)); return 0;
@@ -164,7 +201,7 @@ static ABI int32_t rtc_parse_date_time(DateTime *t, const char *str) {
 
 static const RuntimeExport exports[]={
     {"sceRtcGetCurrentClockLocalTime",rtc_current_local}, {"sceRtcGetCurrentClock",rtc_current_clock},
-    {"sceRtcGetCurrentTick",rtc_current_tick}, {"sceRtcGetCurrentNetworkTick",rtc_current_tick},
+    {"sceRtcGetCurrentTick",rtc_current_tick}, {"sceRtcGetCurrentNetworkTick",rtc_network_tick},
     {"sceRtcConvertUtcToLocalTime",rtc_utc_to_local}, {"sceRtcConvertLocalTimeToUtc",rtc_local_to_utc},
     {"sceRtcGetDayOfWeek",rtc_day_of_week}, {"sceRtcGetTick",rtc_get_tick}, {"sceRtcSetTick",rtc_set_tick},
     {"sceRtcGetTickResolution",rtc_tick_resolution}, {"sceRtcSetTime_t",rtc_set_time_t},

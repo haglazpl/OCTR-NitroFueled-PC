@@ -51,6 +51,21 @@ static int32_t fail_posix(int e) { *runtime_errno()=runtime_guest_errno(e); retu
 /* ---- clocks and sleeping ---- */
 static struct timespec process_start;
 __attribute__((constructor)) static void remember_start(void) { clock_gettime(CLOCK_MONOTONIC,&process_start); }
+
+/* The game's clock calls, counted for the network summary (runtime_kernel_clock_take). The port's
+ * own uses (the GPU library's timestamps) go through other entry points and are not counted. */
+static RuntimeClockCounts clock_counts;
+#define CLOCK_COUNT(field) __atomic_add_fetch(&clock_counts.field,1,__ATOMIC_RELAXED)
+void runtime_kernel_clock_take(RuntimeClockCounts *out) {
+    out->tsc_reads=__atomic_exchange_n(&clock_counts.tsc_reads,0,__ATOMIC_RELAXED);
+    out->tsc_frequency=__atomic_exchange_n(&clock_counts.tsc_frequency,0,__ATOMIC_RELAXED);
+    out->process_time=__atomic_exchange_n(&clock_counts.process_time,0,__ATOMIC_RELAXED);
+    out->process_counter=__atomic_exchange_n(&clock_counts.process_counter,0,__ATOMIC_RELAXED);
+    out->clock_gettime=__atomic_exchange_n(&clock_counts.clock_gettime,0,__ATOMIC_RELAXED);
+    out->gettimeofday=__atomic_exchange_n(&clock_counts.gettimeofday,0,__ATOMIC_RELAXED);
+    out->time=__atomic_exchange_n(&clock_counts.time,0,__ATOMIC_RELAXED);
+    out->clock_ids=__atomic_exchange_n(&clock_counts.clock_ids,0,__ATOMIC_RELAXED);
+}
 static int host_clock(uint32_t id,clockid_t *out) {
     switch (id) {
     case 0: case 9: case 10: *out=CLOCK_REALTIME; return 1;            /* REALTIME(_PRECISE/_FAST) */
@@ -63,6 +78,8 @@ static int host_clock(uint32_t id,clockid_t *out) {
     }
 }
 static int clock_read(uint32_t id,GuestTimespec *ts) {
+    CLOCK_COUNT(clock_gettime);
+    if (id<64) __atomic_or_fetch(&clock_counts.clock_ids,UINT64_C(1)<<id,__ATOMIC_RELAXED);
     clockid_t host;
     if (!ts || !host_clock(id,&host)) return EINVAL;
     struct timespec t;
@@ -94,6 +111,7 @@ static ABI uint64_t process_time_counter(void) {
 static ABI uint64_t process_time_frequency(void) { return 1000000000; }
 static ABI uint64_t read_tsc(void) { return __rdtsc(); }
 static uint64_t tsc_hz;
+static uint64_t tsc_cal_tsc, tsc_cal_ns; /* the end of the calibration, for runtime_tsc_check */
 static ABI uint64_t tsc_frequency(void) {
     if (!tsc_hz) {
         struct timespec a,b,nap={0,20000000};
@@ -106,6 +124,8 @@ static ABI uint64_t tsc_frequency(void) {
         clock_gettime(CLOCK_MONOTONIC,&b); uint64_t t1=__rdtsc();
         uint64_t ns=(uint64_t)(b.tv_sec-a.tv_sec)*1000000000+(uint64_t)(b.tv_nsec-a.tv_nsec);
         tsc_hz=(t1-t0)*1000000000/(ns ? ns : 1);
+        tsc_cal_tsc=t1;
+        tsc_cal_ns=(uint64_t)b.tv_sec*1000000000+(uint64_t)b.tv_nsec;
     }
     return tsc_hz;
 }
@@ -113,6 +133,22 @@ static ABI uint64_t tsc_frequency(void) {
 uint64_t runtime_process_time_us(void) { return process_time(); }
 uint64_t runtime_process_time_counter(void) { return process_time_counter(); }
 uint64_t runtime_tsc_frequency(void) { return tsc_frequency(); }
+int runtime_tsc_check(uint64_t *given_hz, double *measured_hz, double *seconds) {
+    if (!tsc_hz || !tsc_cal_ns) return 0;
+    struct timespec n; clock_gettime(CLOCK_MONOTONIC,&n);
+    const uint64_t t=__rdtsc();
+    const uint64_t ns=(uint64_t)n.tv_sec*1000000000+(uint64_t)n.tv_nsec;
+    if (ns<tsc_cal_ns+UINT64_C(1000000000) || t<tsc_cal_tsc) return 0;
+    *given_hz=tsc_hz;
+    *seconds=(double)(ns-tsc_cal_ns)/1e9;
+    *measured_hz=(double)(t-tsc_cal_tsc)/ *seconds;
+    return 1;
+}
+/* The game's entry points to the clocks above: counted, then the same. */
+static ABI uint64_t guest_process_time(void) { CLOCK_COUNT(process_time); return process_time(); }
+static ABI uint64_t guest_process_time_counter(void) { CLOCK_COUNT(process_counter); return process_time_counter(); }
+static ABI uint64_t guest_read_tsc(void) { CLOCK_COUNT(tsc_reads); return read_tsc(); }
+static ABI uint64_t guest_tsc_frequency(void) { CLOCK_COUNT(tsc_frequency); return tsc_frequency(); }
 /* bbport (frame stats): how often and how long the game sleeps (it polls GPU labels that way). */
 static _Atomic uint64_t sleep_calls, sleep_total_ns;
 void runtime_sleep_stats(uint64_t *calls, uint64_t *ns) {
@@ -165,6 +201,7 @@ static ABI int32_t kernel_gettimezone(GuestTimezone *tz) {
 }
 static ABI int32_t posix_gettimeofday(GuestTimeval *tv,GuestTimezone *tz) {
     struct timeval t;
+    CLOCK_COUNT(gettimeofday);
     gettimeofday(&t,NULL);
     if (tv) { tv->sec=t.tv_sec; tv->usec=t.tv_usec; }
     if (tz) kernel_gettimezone(tz);
@@ -174,7 +211,7 @@ static ABI int32_t kernel_gettimeofday(GuestTimeval *tv) {
     if (!tv) return ERR(22);
     return posix_gettimeofday(tv,NULL);
 }
-static ABI int64_t posix_time(int64_t *out) { int64_t t=(int64_t)time(NULL); if (out) *out=t; return t; }
+static ABI int64_t posix_time(int64_t *out) { CLOCK_COUNT(time); int64_t t=(int64_t)time(NULL); if (out) *out=t; return t; }
 
 /* ---- process ---- */
 static ABI int32_t get_pagesize(void) { return PAGE; }
@@ -447,9 +484,9 @@ static const RuntimeExport exports[]={
     {"sceKernelConvertUtcToLocaltime",utc_to_localtime}, {"sceKernelConvertLocaltimeToUtc",localtime_to_utc},
     {"sceKernelClockGettime",kernel_clock_gettime}, {"clock_gettime",posix_clock_gettime},
     {"clock_getres",posix_clock_getres},
-    {"sceKernelGetProcessTime",process_time}, {"sceKernelGetProcessTimeCounter",process_time_counter},
+    {"sceKernelGetProcessTime",guest_process_time}, {"sceKernelGetProcessTimeCounter",guest_process_time_counter},
     {"sceKernelGetProcessTimeCounterFrequency",process_time_frequency},
-    {"sceKernelReadTsc",read_tsc}, {"sceKernelGetTscFrequency",tsc_frequency},
+    {"sceKernelReadTsc",guest_read_tsc}, {"sceKernelGetTscFrequency",guest_tsc_frequency},
     {"sceKernelUsleep",kernel_usleep}, {"usleep",posix_usleep}, {"sleep",posix_sleep},
     {"nanosleep",posix_nanosleep}, {"sceKernelNanosleep",kernel_nanosleep},
     {"sceKernelGettimezone",kernel_gettimezone}, {"gettimeofday",posix_gettimeofday},

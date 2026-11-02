@@ -10,6 +10,7 @@
 #include <stdarg.h>
 #include <time.h>
 #include <stdatomic.h>
+#include <pthread.h>
 
 #define ORBIS_OK 0
 #define ORBIS_NET_ENETUNREACH ((int32_t)0x80410133)
@@ -22,6 +23,7 @@
 #define NET_CTL_INVALID_ADDR  ((int32_t)0x80412107)
 
 static int g_net_initialized = 0;
+static void clock_check_start(void); /* the PC clock check (below) */
 /* sceNetErrnoLoc is per thread on the PS4. One value shared by every thread let a thread read
  * another one's error (a failure in place of its own EWOULDBLOCK, for example). */
 static _Thread_local int32_t g_net_errno = 0;
@@ -87,7 +89,8 @@ int32_t runtime_net_init(void) {
 #endif
         net_overrides_init();
         g_net_initialized = 1;
-        runtime_net_trace("sceNetInit completed (NET-PATCH v4: peeks kept, per-player summary, one copy per datagram)");
+        runtime_net_trace("sceNetInit completed (NET-PATCH v5: peeks kept, per-player summary, one copy per datagram, clock and sender diagnostics)");
+        clock_check_start();
     }
     runtime_friends_start();
     return ORBIS_OK;
@@ -806,6 +809,7 @@ static NetStat g_netstat[NETSTAT_MAX_PEERS];
 static uint64_t g_netstat_window;    /* start of the current window, 0 before the first */
 static uint32_t g_netstat_peeks;
 static uint32_t g_netstat_read_gap;  /* longest wait between two reads of the game socket */
+static uint32_t g_netstat_read_33, g_netstat_read_50; /* waits of 33 ms and 50 ms or more */
 static uint64_t g_netstat_last_read;
 static atomic_flag g_netstat_lock = ATOMIC_FLAG_INIT;
 
@@ -884,6 +888,8 @@ static void netstat_on_read_call(void) {
     const uint64_t last = __atomic_exchange_n(&g_netstat_last_read, now, __ATOMIC_RELAXED);
     if (!last || now <= last || now - last > 10000u) return; /* not reading at all: not a stall */
     const uint32_t gap = (uint32_t)(now - last);
+    if (gap >= 33) __atomic_add_fetch(&g_netstat_read_33, 1, __ATOMIC_RELAXED);
+    if (gap >= 50) __atomic_add_fetch(&g_netstat_read_50, 1, __ATOMIC_RELAXED);
     if (gap > __atomic_load_n(&g_netstat_read_gap, __ATOMIC_RELAXED))
         __atomic_store_n(&g_netstat_read_gap, gap, __ATOMIC_RELAXED);
 }
@@ -958,6 +964,218 @@ static void netstat_on_recv(const struct sockaddr_in *from, const uint8_t *data,
     }
 }
 
+/* ---- Senders and clocks (net3 diagnostics) ---------------------------------------------------
+ * Which of the game's code sends to the players (its address in the game image), how much, and
+ * the timer between its rounds of sends: the start for changing the game's ~13 updates/s. And the
+ * game's use of clocks: how often it reads each one, which code reads the "network" clock (on a
+ * PS4 a time all consoles share, here this PC's own clock), and how far the CPU timer speed the
+ * game was given is from the speed measured over the whole session. */
+#define SENDSITE_MAX 8
+
+typedef struct {
+    uintptr_t caller;
+    uint32_t packets, bytes, max_len, rounds, gap_min, gap_max;
+    uint64_t gap_sum;
+    uint64_t last_send, round_start;
+} SendSite;
+
+static SendSite g_sendsites[SENDSITE_MAX];
+static atomic_flag g_sendsite_lock = ATOMIC_FLAG_INIT;
+static const unsigned char *g_image;
+static size_t g_image_size;
+
+void runtime_net_set_image(const unsigned char *image, size_t size) {
+    g_image = image;
+    g_image_size = size;
+}
+
+/* "game +0x..." for an address in the game's image, the address itself otherwise. */
+static void code_where(uintptr_t address, char *out, size_t cap) {
+    if (g_image && address >= (uintptr_t)g_image && address < (uintptr_t)g_image + g_image_size)
+        snprintf(out, cap, "game +0x%llx", (unsigned long long)(address - (uintptr_t)g_image));
+    else
+        snprintf(out, cap, "0x%llx", (unsigned long long)address);
+}
+
+static void sendsite_on_send(const void *caller, const struct sockaddr_in *to, size_t len) {
+    struct sockaddr_in server;
+    if (!caller || !netstat_interval() || !tunnel_server(&server) || to->sin_addr.s_addr == server.sin_addr.s_addr) return;
+    const uint64_t now = now_ms();
+    while (atomic_flag_test_and_set_explicit(&g_sendsite_lock, memory_order_acquire)) {}
+    SendSite *s = NULL;
+    for (int i = 0; i < SENDSITE_MAX && !s; i++)
+        if (!g_sendsites[i].caller || g_sendsites[i].caller == (uintptr_t)caller) s = &g_sendsites[i];
+    if (s) {
+        s->caller = (uintptr_t)caller;
+        s->packets++;
+        s->bytes += (uint32_t)len;
+        if (len > s->max_len) s->max_len = (uint32_t)len;
+        /* Sends more than 5 ms apart start a new round (a round sends to every player at once). */
+        if (!s->last_send || now - s->last_send > 5) {
+            if (s->round_start && now > s->round_start && now - s->round_start < 10000) {
+                const uint32_t gap = (uint32_t)(now - s->round_start);
+                s->rounds++;
+                s->gap_sum += gap;
+                if (!s->gap_min || gap < s->gap_min) s->gap_min = gap;
+                if (gap > s->gap_max) s->gap_max = gap;
+            }
+            s->round_start = now;
+        }
+        s->last_send = now;
+    }
+    atomic_flag_clear_explicit(&g_sendsite_lock, memory_order_release);
+}
+
+static void report_senders(double secs) {
+    SendSite snap[SENDSITE_MAX];
+    int n = 0;
+    while (atomic_flag_test_and_set_explicit(&g_sendsite_lock, memory_order_acquire)) {}
+    for (int i = 0; i < SENDSITE_MAX; i++) {
+        SendSite *s = &g_sendsites[i];
+        if (!s->caller || !s->packets) continue;
+        snap[n++] = *s;
+        s->packets = s->bytes = s->max_len = s->rounds = s->gap_min = s->gap_max = 0;
+        s->gap_sum = 0;
+    }
+    atomic_flag_clear_explicit(&g_sendsite_lock, memory_order_release);
+    for (int i = 0; i < n; i++) {
+        const SendSite *s = &snap[i];
+        char where[40];
+        code_where(s->caller, where, sizeof(where));
+        runtime_net_trace("Net   sender %-18s %u packets (%.0f/s), avg %u B, max %u B | %u rounds (%.1f/s), every %u-%u ms (avg %.0f ms)",
+                          where, s->packets, s->packets / secs, s->bytes / s->packets, s->max_len, s->rounds,
+                          s->rounds / secs, s->gap_min, s->gap_max, s->rounds ? (double)s->gap_sum / s->rounds : 0.0);
+    }
+}
+
+static void report_clocks(double secs) {
+    RuntimeClockCounts c;
+    runtime_kernel_clock_take(&c);
+    uint64_t network = 0, current = 0;
+    uintptr_t callers[8];
+    uint32_t counts[8];
+    const int nc = runtime_rtc_clock_take(&network, &current, callers, counts, 8);
+    char ids[64] = "", who[256] = "";
+    size_t at = 0;
+    for (int i = 0; i < 64; i++)
+        if (c.clock_ids & (UINT64_C(1) << i)) at += (size_t)snprintf(ids + at, sizeof(ids) - at, "%s%d", at ? "," : "", i);
+    at = 0;
+    for (int i = 0; i < nc && at < sizeof(who) - 48; i++) {
+        char where[40];
+        code_where(callers[i], where, sizeof(where));
+        at += (size_t)snprintf(who + at, sizeof(who) - at, "%s%s x%u", i ? ", " : " from ", where, counts[i]);
+    }
+    runtime_net_trace("Net   clock reads/s: network tick %.0f%s | RTC tick %.0f | TSC %.0f (frequency %.0f) | process time %.0f, counter %.0f | clock_gettime %.0f (ids %s) | gettimeofday %.0f | time() %.0f",
+                      network / secs, who, current / secs, c.tsc_reads / secs, c.tsc_frequency / secs,
+                      c.process_time / secs, c.process_counter / secs, c.clock_gettime / secs, ids[0] ? ids : "-",
+                      c.gettimeofday / secs, c.time / secs);
+    uint64_t given;
+    double measured, over;
+    if (runtime_tsc_check(&given, &measured, &over)) {
+        const double ppm = (measured - (double)given) / (double)given * 1e6;
+        runtime_net_trace("Net   CPU timer: the game was told %.3f MHz, measured over %.0f s %.3f MHz: the game's timer runs %+.0f ppm (%+.0f ms per 3 minutes)",
+                          given / 1e6, over, measured / 1e6, ppm, ppm * 0.18);
+    }
+}
+
+/* This PC's clock against a time server (SNTP, UDP 123), at the start and every 10 minutes: the
+ * clock the game reads as its "network" time. BB_NET_CLOCK_CHECK=0 turns it off. */
+static int64_t wall_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static int64_t ntp_us(const uint8_t *p) {
+    const uint32_t sec = (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+    const uint32_t frac = (uint32_t)p[4] << 24 | (uint32_t)p[5] << 16 | (uint32_t)p[6] << 8 | p[7];
+    if (!sec) return 0;
+    return ((int64_t)sec - 2208988800LL) * 1000000LL + (int64_t)(((uint64_t)frac * 1000000u) >> 32);
+}
+
+/* The best of three exchanges with host ("name" or "name:port", port 123 by default): 1 with
+ * *offset_us (server minus this PC) and *rtt_us. */
+static int sntp_query(const char *host, int64_t *offset_us, int64_t *rtt_us) {
+    char name[128];
+    const char *port = "123";
+    snprintf(name, sizeof(name), "%s", host);
+    char *colon = strchr(name, ':');
+    if (colon) {
+        *colon = '\0';
+        port = colon + 1;
+    }
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(name, port, &hints, &res) != 0 || !res) return 0;
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s == INVALID_SOCKET) {
+        freeaddrinfo(res);
+        return 0;
+    }
+#ifdef _WIN32
+    DWORD wait = 1500;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&wait, sizeof(wait));
+#else
+    struct timeval wait = {1, 500000};
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &wait, sizeof(wait));
+#endif
+    int got = 0;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        uint8_t request[48] = {0x23}, reply[64];
+        const int64_t t1 = wall_us();
+        if (sendto(s, (const char *)request, sizeof(request), 0, res->ai_addr, (int)res->ai_addrlen) != (int)sizeof(request)) break;
+        const int n = (int)recv(s, (char *)reply, sizeof(reply), 0);
+        const int64_t t4 = wall_us();
+        if (n < 48 || (reply[0] & 7) != 4) continue;
+        const int64_t t2 = ntp_us(reply + 32), t3 = ntp_us(reply + 40);
+        if (!t2 || !t3) continue;
+        const int64_t rtt = (t4 - t1) - (t3 - t2);
+        if (!got || rtt < *rtt_us) {
+            *rtt_us = rtt;
+            *offset_us = ((t2 - t1) + (t3 - t4)) / 2;
+        }
+        got = 1;
+    }
+    closesocket(s);
+    freeaddrinfo(res);
+    return got;
+}
+
+static void *clock_check(void *arg) {
+    (void)arg;
+    /* BB_NET_CLOCK_SERVER=<name[:port]> asks that server instead. */
+    const char *const servers[] = {getenv("BB_NET_CLOCK_SERVER") ? getenv("BB_NET_CLOCK_SERVER") : "time.windows.com",
+                                   "pool.ntp.org", "time.google.com"};
+    const int count = getenv("BB_NET_CLOCK_SERVER") ? 1 : 3;
+    for (;;) {
+        int done = 0;
+        for (int i = 0; i < count && !done; i++) {
+            int64_t offset = 0, rtt = 0;
+            if (!sntp_query(servers[i], &offset, &rtt)) continue;
+            const int64_t ahead = -offset; /* this PC minus the server */
+            runtime_net_trace("Clock: this PC's clock is %.0f ms %s %s (round trip %.0f ms)",
+                              (ahead < 0 ? -ahead : ahead) / 1000.0, ahead < 0 ? "behind" : "ahead of", servers[i], rtt / 1000.0);
+            done = 1;
+        }
+        if (!done) runtime_net_trace("Clock: no time server answered (UDP 123): this PC's clock offset is unknown");
+#ifdef _WIN32
+        Sleep(600000);
+#else
+        sleep(600);
+#endif
+    }
+    return NULL;
+}
+
+static void clock_check_start(void) {
+    const char *v = getenv("BB_NET_CLOCK_CHECK");
+    if ((v && strcmp(v, "0") == 0) || !runtime_net_is_online()) return;
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, clock_check, NULL) == 0) pthread_detach(thread);
+}
+
 /* The summary when the window is over (any thread; one of them prints it). */
 static void netstat_maybe_report(void) {
     const uint32_t interval = netstat_interval();
@@ -991,13 +1209,15 @@ static void netstat_maybe_report(void) {
     const uint32_t peeks = __atomic_exchange_n(&g_netstat_peeks, 0, __ATOMIC_RELAXED);
     const uint32_t read_gap = __atomic_exchange_n(&g_netstat_read_gap, 0, __ATOMIC_RELAXED);
     const uint32_t copies_dropped = __atomic_exchange_n(&g_mp_dropped, 0, __ATOMIC_RELAXED);
+    const uint32_t stalls_33 = __atomic_exchange_n(&g_netstat_read_33, 0, __ATOMIC_RELAXED);
+    const uint32_t stalls_50 = __atomic_exchange_n(&g_netstat_read_50, 0, __ATOMIC_RELAXED);
     if (!n) return;
 
     const double secs = (double)(now - start) / 1000.0;
     char clock[16];
     netstat_clock(clock, sizeof(clock));
-    runtime_net_trace("Net %s summary (%.1f s): %d player address(es); longest wait between reads of the game socket %u ms; peeks %u; second copies dropped %u",
-                      clock, secs, n, read_gap, peeks, copies_dropped);
+    runtime_net_trace("Net %s summary (%.1f s): %d player address(es); longest wait between reads of the game socket %u ms (>=33 ms x%u, >=50 ms x%u); peeks %u; second copies dropped %u",
+                      clock, secs, n, read_gap, stalls_33, stalls_50, peeks, copies_dropped);
     for (int i = 0; i < n; i++) {
         const NetCounts *c = &snap[i].c;
         char name[PING_NAME + 2], ping[16], addr[24];
@@ -1012,6 +1232,8 @@ static void netstat_maybe_report(void) {
                           c->out_pkts, c->out_pkts / secs, c->out_bytes / 1024.0 / secs,
                           c->copies_relay, c->copies_server, c->gap_max, c->gaps_100, c->gaps_250);
     }
+    report_senders(secs);
+    report_clocks(secs);
 }
 
 int32_t runtime_net_send(int s, const void *msg, size_t len, int flags) {
@@ -1040,6 +1262,11 @@ int32_t runtime_net_send(int s, const void *msg, size_t len, int flags) {
 }
 
 int32_t runtime_net_sendto(int s, const void *msg, size_t len, int flags, const OrbisNetSockaddr *to, uint32_t tolen) {
+    return runtime_net_sendto_from(s, msg, len, flags, to, tolen, NULL);
+}
+
+int32_t runtime_net_sendto_from(int s, const void *msg, size_t len, int flags, const OrbisNetSockaddr *to, uint32_t tolen,
+                                const void *caller) {
     (void)tolen;
     VSocket *vs = vsocket_get(s);
     if (!vs) return ORBIS_NET_EBADF;
@@ -1076,6 +1303,7 @@ int32_t runtime_net_sendto(int s, const void *msg, size_t len, int flags, const 
     if (to && vs->tunnel) {
         const int route = tunnel_copy(vs, msg, len, &sin);
         netstat_on_send(&sin, len, route);
+        sendsite_on_send(caller, &sin, len);
         ping_after_send(vs, &sin);
         netstat_maybe_report();
     }
