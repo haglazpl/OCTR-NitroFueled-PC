@@ -63,10 +63,9 @@ static void from_tick(uint64_t tick, DateTime *t) {
     t->hour=(uint16_t)(us/3600000000u); t->minute=(uint16_t)(us/60000000u%60); t->second=(uint16_t)(us/1000000u%60);
     t->microsecond=(uint32_t)(us%1000000u);
 }
-/* "Now" as the game sees it: this PC's clock with the time servers' offset (runtime_wall_offset_us). */
+/* "Now" as the game sees it: the game's wall clock (runtime_wall_now_us). */
 static uint64_t now_utc(void) {
-    struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
-    return (uint64_t)((int64_t)(UNIX_EPOCH_TICKS+(uint64_t)ts.tv_sec*1000000u+(uint64_t)ts.tv_nsec/1000u)+runtime_wall_offset_us());
+    return UNIX_EPOCH_TICKS+(uint64_t)runtime_wall_now_us();
 }
 /* Offset of local time from UTC at the given UTC tick, in microseconds. */
 static int64_t local_offset(uint64_t utc) {

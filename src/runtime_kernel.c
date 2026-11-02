@@ -52,33 +52,51 @@ static int32_t fail_posix(int e) { *runtime_errno()=runtime_guest_errno(e); retu
 static struct timespec process_start;
 __attribute__((constructor)) static void remember_start(void) { clock_gettime(CLOCK_MONOTONIC,&process_start); }
 
-/* The wall clock the game reads is this PC's plus the time servers' offset that run.py measured
- * just before starting the game (BB_CLOCK_OFFSET_US, microseconds; set from the first read on, so
- * the game never sees it jump). PS4s keep their clocks network-synced; PCs were seconds apart (the
- * 2026-11-02 logs: 6 s for one player), and the game's network code reads the wall clock (about
- * 420 gettimeofday calls a second per connected player). Monotonic clocks and the TSC stay as they
- * are. */
-int64_t runtime_wall_offset_us(void) {
-    static int64_t offset;
-    static int read;
-    if (!__atomic_load_n(&read,__ATOMIC_ACQUIRE)) {
-        const char *env=getenv("BB_CLOCK_OFFSET_US");
-        long long v=0;
-        int64_t value=0;
-        if (env && sscanf(env,"%lld",&v)==1 && v>-86400000000ll && v<86400000000ll) value=(int64_t)v;
-        __atomic_store_n(&offset,value,__ATOMIC_RELAXED);
-        __atomic_store_n(&read,1,__ATOMIC_RELEASE);
-    }
-    return __atomic_load_n(&offset,__ATOMIC_RELAXED);
+/* The wall clock the game reads. PS4s keep their clocks network-synced; PCs were seconds apart
+ * (the 2026-11-02 logs: 6 s for one player), drift by tens of ms an hour, and Windows can step its
+ * clock in the middle of a game, while the game's network code (Demonware's bdPlatformTiming, on
+ * _Xtime_get_ticks) times itself on the wall clock, about 420 reads a second per connected player.
+ * So the game's wall clock is the monotonic clock plus a base taken at its first read: this PC's
+ * clock corrected by the time servers' offset that run.py measured just before starting the game
+ * (BB_CLOCK_OFFSET_US). It never jumps when Windows changes its clock, and runtime_net.c re-measures
+ * it every 10 minutes and slews the base (runtime_wall_adjust_us) at no more than 1 ms a second.
+ * BB_CLOCK_FIX=0 gives the game this PC's clock as it is. Monotonic clocks and the TSC are untouched. */
+static int64_t wall_base_us;
+static int wall_base_ready;
+static atomic_flag wall_base_lock = ATOMIC_FLAG_INIT;
+static int64_t mono_now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (int64_t)t.tv_sec*1000000+t.tv_nsec/1000; }
+static int64_t pc_now_us(void) { struct timespec t; clock_gettime(CLOCK_REALTIME,&t); return (int64_t)t.tv_sec*1000000+t.tv_nsec/1000; }
+int runtime_wall_fixed(void) {
+    static int fixed=-1;
+    if (fixed<0) { const char *v=getenv("BB_CLOCK_FIX"); fixed=!(v && strcmp(v,"0")==0); }
+    return fixed;
 }
-/* A host timespec moved by the wall-clock offset. */
-static void wall_correct(struct timespec *t) {
-    const int64_t off=runtime_wall_offset_us();
-    if (!off) return;
-    int64_t ns=(int64_t)t->tv_nsec+(off%1000000)*1000;
-    int64_t sec=(int64_t)t->tv_sec+off/1000000;
-    if (ns<0) { ns+=1000000000; --sec; } else if (ns>=1000000000) { ns-=1000000000; ++sec; }
-    t->tv_sec=(time_t)sec; t->tv_nsec=(long)ns;
+int64_t runtime_wall_now_us(void) {
+    if (!runtime_wall_fixed()) return pc_now_us();
+    if (!__atomic_load_n(&wall_base_ready,__ATOMIC_ACQUIRE)) {
+        while (atomic_flag_test_and_set_explicit(&wall_base_lock,memory_order_acquire)) {}
+        if (!__atomic_load_n(&wall_base_ready,__ATOMIC_RELAXED)) {
+            const char *env=getenv("BB_CLOCK_OFFSET_US");
+            long long v=0;
+            int64_t offset=0;
+            if (env && sscanf(env,"%lld",&v)==1 && v>-86400000000ll && v<86400000000ll) offset=(int64_t)v;
+            __atomic_store_n(&wall_base_us,pc_now_us()+offset-mono_now_us(),__ATOMIC_RELAXED);
+            __atomic_store_n(&wall_base_ready,1,__ATOMIC_RELEASE);
+        }
+        atomic_flag_clear_explicit(&wall_base_lock,memory_order_release);
+    }
+    return mono_now_us()+__atomic_load_n(&wall_base_us,__ATOMIC_RELAXED);
+}
+void runtime_wall_adjust_us(int64_t delta) {
+    if (!runtime_wall_fixed()) return;
+    (void)runtime_wall_now_us(); /* the base exists */
+    __atomic_add_fetch(&wall_base_us,delta,__ATOMIC_RELAXED);
+}
+int64_t runtime_wall_offset_us(void) { return runtime_wall_now_us()-pc_now_us(); }
+/* The game's wall clock as a host timespec. */
+static void wall_now(struct timespec *t) {
+    const int64_t us=runtime_wall_now_us();
+    t->tv_sec=(time_t)(us/1000000); t->tv_nsec=(long)(us%1000000)*1000;
 }
 
 /* The game's clock calls, counted for the network summary (runtime_kernel_clock_take). The port's
@@ -134,7 +152,7 @@ static int clock_read(uint32_t id,GuestTimespec *ts) {
     if (!ts || !host_clock(id,&host)) return EINVAL;
     struct timespec t;
     if (clock_gettime(host,&t)) return errno;
-    if (id==0 || id==9 || id==10 || id==13) wall_correct(&t); /* the realtime clocks */
+    if (id==0 || id==9 || id==10 || id==13) wall_now(&t); /* the realtime clocks: the game's wall clock */
     if (id==13) t.tv_nsec=0;
     ts->sec=t.tv_sec; ts->nsec=t.tv_nsec; return 0;
 }
@@ -256,13 +274,8 @@ static int32_t read_timeofday(GuestTimeval *tv,GuestTimezone *tz,const void *cal
     struct timeval t;
     CLOCK_COUNT(gettimeofday);
     clock_note_caller(0,caller);
-    gettimeofday(&t,NULL);
-    const int64_t off=runtime_wall_offset_us();
-    if (off) {
-        int64_t us=(int64_t)t.tv_usec+off%1000000, sec=(int64_t)t.tv_sec+off/1000000;
-        if (us<0) { us+=1000000; --sec; } else if (us>=1000000) { us-=1000000; ++sec; }
-        t.tv_sec=(time_t)sec; t.tv_usec=(long)us;
-    }
+    const int64_t now=runtime_wall_now_us();
+    t.tv_sec=(time_t)(now/1000000); t.tv_usec=(long)(now%1000000);
     if (tv) { tv->sec=t.tv_sec; tv->usec=t.tv_usec; }
     if (tz) kernel_gettimezone(tz);
     return 0;
@@ -276,8 +289,7 @@ static ABI int32_t kernel_gettimeofday(GuestTimeval *tv) {
 }
 static ABI int64_t posix_time(int64_t *out) {
     CLOCK_COUNT(time);
-    struct timespec now; clock_gettime(CLOCK_REALTIME,&now); wall_correct(&now);
-    int64_t t=(int64_t)now.tv_sec; if (out) *out=t; return t;
+    int64_t t=runtime_wall_now_us()/1000000; if (out) *out=t; return t;
 }
 
 /* ---- process ---- */

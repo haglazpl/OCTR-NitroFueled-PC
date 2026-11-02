@@ -89,7 +89,7 @@ int32_t runtime_net_init(void) {
 #endif
         net_overrides_init();
         g_net_initialized = 1;
-        runtime_net_trace("sceNetInit completed (NET-PATCH v7: peeks kept, per-player summary, one copy per datagram, one player per address, corrected wall clock, clock and sender diagnostics)");
+        runtime_net_trace("sceNetInit completed (NET-PATCH v8: peeks kept, per-player summary, one copy per datagram, one player per address, corrected and slewed wall clock, clock, sender and send-chain diagnostics)");
         clock_check_start();
     }
     runtime_friends_start();
@@ -1079,11 +1079,124 @@ static void code_where(uintptr_t address, char *out, size_t cap) {
         snprintf(out, cap, "0x%llx", (unsigned long long)address);
 }
 
-static void sendsite_on_send(const void *caller, const struct sockaddr_in *to, size_t len) {
+/* The call chain of each send to a player: the return addresses up the game's frame-pointer chain
+ * (its code keeps rbp frames), each frame checked against this thread's stack and the game image,
+ * so the walk stops at the first frame that is not one. Each distinct chain is logged once in full
+ * and then counted per summary: the way from the game's network update to sendto, to find what
+ * paces it (~13 rounds a second). */
+#define STACK_DEPTH 16
+#define STACKS_MAX 16
+
+typedef struct {
+    uint64_t hash;
+    uint32_t count;
+    int depth, printed;
+    uintptr_t ret[STACK_DEPTH];
+} SendStack;
+
+static SendStack g_stacks[STACKS_MAX];
+
+static int stack_bounds(uintptr_t *lo, uintptr_t *hi) {
+#ifdef _WIN32
+    typedef VOID (WINAPI *Limits)(PULONG_PTR, PULONG_PTR);
+    static Limits limits;
+    static int looked;
+    if (!looked) {
+        limits = (Limits)(void (*)(void))GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetCurrentThreadStackLimits");
+        looked = 1;
+    }
+    if (!limits) return 0;
+    ULONG_PTR low = 0, high = 0;
+    limits(&low, &high);
+    *lo = (uintptr_t)low;
+    *hi = (uintptr_t)high;
+    return high > low;
+#else
+    pthread_attr_t a;
+    void *base = NULL;
+    size_t size = 0;
+    if (pthread_getattr_np(pthread_self(), &a)) return 0;
+    const int ok = !pthread_attr_getstack(&a, &base, &size);
+    pthread_attr_destroy(&a);
+    if (!ok) return 0;
+    *lo = (uintptr_t)base;
+    *hi = (uintptr_t)base + size;
+    return 1;
+#endif
+}
+
+/* The return addresses above frame (the caller's rbp), at most max. */
+static int guest_chain(const void *frame, uintptr_t *out, int max) {
+    uintptr_t lo, hi;
+    if (!frame || !g_image || !stack_bounds(&lo, &hi)) return 0;
+    const uintptr_t code_lo = (uintptr_t)g_image, code_hi = (uintptr_t)g_image + g_image_size;
+    uintptr_t fp = (uintptr_t)frame;
+    int n = 0;
+    while (n < max && !(fp & 7) && fp >= lo && fp + 16 <= hi) {
+        const uintptr_t next = ((const uintptr_t *)fp)[0], ret = ((const uintptr_t *)fp)[1];
+        if (ret < code_lo || ret >= code_hi) break;
+        out[n++] = ret;
+        if (next <= fp) break;
+        fp = next;
+    }
+    return n;
+}
+
+/* Holds g_sendsite_lock. */
+static void stack_note(const uintptr_t *ret, int depth) {
+    uint64_t h = 14695981039346656037ULL ^ (uint64_t)depth;
+    for (int i = 0; i < depth; i++) {
+        h ^= ret[i];
+        h *= 1099511628211ULL;
+    }
+    SendStack *slot = NULL;
+    for (int i = 0; i < STACKS_MAX && !slot; i++)
+        if (!g_stacks[i].depth || (g_stacks[i].hash == h && g_stacks[i].depth == depth)) slot = &g_stacks[i];
+    if (!slot) return;
+    if (!slot->depth) {
+        slot->hash = h;
+        slot->depth = depth;
+        memcpy(slot->ret, ret, sizeof(*ret) * (size_t)depth);
+    }
+    slot->count++;
+}
+
+static void report_stacks(void) {
+    char line[1400], counts[400];
+    size_t used = 0;
+    counts[0] = '\0';
+    for (int i = 0; i < STACKS_MAX; i++) {
+        SendStack s;
+        while (atomic_flag_test_and_set_explicit(&g_sendsite_lock, memory_order_acquire)) {}
+        s = g_stacks[i];
+        g_stacks[i].count = 0;
+        if (g_stacks[i].depth && !g_stacks[i].printed && s.count) g_stacks[i].printed = 1;
+        atomic_flag_clear_explicit(&g_sendsite_lock, memory_order_release);
+        if (!s.depth || !s.count) continue;
+        if (!s.printed) {
+            size_t at = (size_t)snprintf(line, sizeof(line), "Net   send chain #%d:", i + 1);
+            for (int k = 0; k < s.depth && at < sizeof(line) - 40; k++) {
+                char where[40];
+                code_where(s.ret[k], where, sizeof(where));
+                at += (size_t)snprintf(line + at, sizeof(line) - at, "%s %s", k ? " <" : "", where);
+            }
+            runtime_net_trace("%s", line);
+        }
+        if (used < sizeof(counts) - 24)
+            used += (size_t)snprintf(counts + used, sizeof(counts) - used, "%s#%d x%u", used ? ", " : "", i + 1, s.count);
+    }
+    if (used) runtime_net_trace("Net   send chains: %s", counts);
+}
+
+static void sendsite_on_send(const void *caller, const void *frame, const struct sockaddr_in *to, size_t len) {
     struct sockaddr_in server;
     if (!caller || !netstat_interval() || !tunnel_server(&server) || to->sin_addr.s_addr == server.sin_addr.s_addr) return;
     const uint64_t now = now_ms();
+    uintptr_t chain[STACK_DEPTH];
+    chain[0] = (uintptr_t)caller;
+    const int depth = 1 + guest_chain(frame, chain + 1, STACK_DEPTH - 1);
     while (atomic_flag_test_and_set_explicit(&g_sendsite_lock, memory_order_acquire)) {}
+    stack_note(chain, depth);
     SendSite *s = NULL;
     for (int i = 0; i < SENDSITE_MAX && !s; i++)
         if (!g_sendsites[i].caller || g_sendsites[i].caller == (uintptr_t)caller) s = &g_sendsites[i];
@@ -1175,12 +1288,13 @@ static void report_clocks(double secs) {
     }
 }
 
-/* This PC's clock against a time server (SNTP, UDP 123), at the start and every 10 minutes: the
- * clock the game reads as its "network" time. BB_NET_CLOCK_CHECK=0 turns it off. */
+/* The game's wall clock against a time server (SNTP, UDP 123), at the start and every 10 minutes:
+ * logged with this PC's own clock, and slewed toward the server's at no more than 1 ms a second
+ * (runtime_wall_adjust_us), so a PC's drift (tens of ms an hour) never builds up. When run.py
+ * found no time server, the first answer here corrects the game's clock at once (that is still at
+ * the start screen). BB_NET_CLOCK_CHECK=0 turns the check off. */
 static int64_t wall_us(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+    return runtime_wall_now_us();
 }
 
 static int64_t ntp_us(const uint8_t *p) {
@@ -1246,23 +1360,46 @@ static void *clock_check(void *arg) {
     const char *const servers[] = {getenv("BB_NET_CLOCK_SERVER") ? getenv("BB_NET_CLOCK_SERVER") : "time.windows.com",
                                    "pool.ntp.org", "time.google.com"};
     const int count = getenv("BB_NET_CLOCK_SERVER") ? 1 : 3;
+    int64_t pending = 0;        /* microseconds still to slew */
+    uint64_t next_check = 0;
+    int first = 1;
     for (;;) {
-        int done = 0;
-        for (int i = 0; i < count && !done; i++) {
-            int64_t offset = 0, rtt = 0;
-            if (!sntp_query(servers[i], &offset, &rtt)) continue;
-            const int64_t ahead = -offset; /* this PC minus the server */
-            const int64_t game = ahead + runtime_wall_offset_us(); /* the game's clock minus the server */
-            runtime_net_trace("Clock: this PC's clock is %.0f ms %s %s (round trip %.0f ms); the game's clock (corrected by %+.0f ms) is %.0f ms %s",
-                              (ahead < 0 ? -ahead : ahead) / 1000.0, ahead < 0 ? "behind" : "ahead of", servers[i], rtt / 1000.0,
-                              runtime_wall_offset_us() / 1000.0, (game < 0 ? -game : game) / 1000.0, game < 0 ? "behind" : "ahead");
-            done = 1;
+        const uint64_t now = now_ms();
+        if (now >= next_check) {
+            int done = 0;
+            for (int i = 0; i < count && !done; i++) {
+                int64_t offset = 0, rtt = 0; /* the server minus the game's clock */
+                if (!sntp_query(servers[i], &offset, &rtt)) continue;
+                const int64_t game = -offset;                           /* the game's clock minus the server */
+                const int64_t pc = game - runtime_wall_offset_us();     /* this PC's clock minus the server */
+                runtime_net_trace("Clock: this PC's clock is %.0f ms %s %s (round trip %.0f ms); the game's clock is %.0f ms %s",
+                                  (pc < 0 ? -pc : pc) / 1000.0, pc < 0 ? "behind" : "ahead of", servers[i], rtt / 1000.0,
+                                  (game < 0 ? -game : game) / 1000.0, game < 0 ? "behind" : "ahead");
+                if (runtime_wall_fixed()) {
+                    if (first && !getenv("BB_CLOCK_OFFSET_US") && (offset > 100000 || offset < -100000)) {
+                        runtime_wall_adjust_us(offset);
+                        runtime_net_trace("Clock: the game's clock corrected at once by %+.0f ms (run.py found no time server)", offset / 1000.0);
+                        pending = 0;
+                    } else {
+                        pending = (offset > 5000 || offset < -5000) ? offset : 0;
+                        if (pending) runtime_net_trace("Clock: slewing the game's clock by %+.0f ms (1 ms a second at most)", pending / 1000.0);
+                    }
+                }
+                done = 1;
+            }
+            if (!done) runtime_net_trace("Clock: no time server answered (UDP 123): the game's clock offset is unknown");
+            first = 0;
+            next_check = now + 600000;
         }
-        if (!done) runtime_net_trace("Clock: no time server answered (UDP 123): this PC's clock offset is unknown");
+        if (pending) {
+            const int64_t step = pending > 100 ? 100 : pending < -100 ? -100 : pending; /* 100 us per 100 ms */
+            runtime_wall_adjust_us(step);
+            pending -= step;
+        }
 #ifdef _WIN32
-        Sleep(600000);
+        Sleep(100);
 #else
-        sleep(600);
+        usleep(100000);
 #endif
     }
     return NULL;
@@ -1332,6 +1469,7 @@ static void netstat_maybe_report(void) {
                           c->copies_relay, c->copies_server, c->gap_max, c->gaps_100, c->gaps_250);
     }
     report_senders(secs);
+    report_stacks();
     report_clocks(secs);
 }
 
@@ -1361,11 +1499,11 @@ int32_t runtime_net_send(int s, const void *msg, size_t len, int flags) {
 }
 
 int32_t runtime_net_sendto(int s, const void *msg, size_t len, int flags, const OrbisNetSockaddr *to, uint32_t tolen) {
-    return runtime_net_sendto_from(s, msg, len, flags, to, tolen, NULL);
+    return runtime_net_sendto_from(s, msg, len, flags, to, tolen, NULL, NULL);
 }
 
 int32_t runtime_net_sendto_from(int s, const void *msg, size_t len, int flags, const OrbisNetSockaddr *to, uint32_t tolen,
-                                const void *caller) {
+                                const void *caller, const void *frame) {
     (void)tolen;
     VSocket *vs = vsocket_get(s);
     if (!vs) return ORBIS_NET_EBADF;
@@ -1402,7 +1540,7 @@ int32_t runtime_net_sendto_from(int s, const void *msg, size_t len, int flags, c
     if (to && vs->tunnel) {
         const int route = tunnel_copy(vs, msg, len, &sin);
         netstat_on_send(&sin, len, route);
-        sendsite_on_send(caller, &sin, len);
+        sendsite_on_send(caller, frame, &sin, len);
         ping_after_send(vs, &sin);
         netstat_maybe_report();
     }

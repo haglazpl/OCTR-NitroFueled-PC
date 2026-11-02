@@ -298,8 +298,10 @@ static ABI int32_t net_listen(int s,int backlog) { return runtime_net_listen(s,b
 static ABI int32_t net_accept(int s,void *addr,uint32_t *addrlen) { return runtime_net_accept(s,(OrbisNetSockaddr*)addr,addrlen); }
 static ABI int32_t net_send(int s,const void *msg,size_t len,int flags) { return runtime_net_send(s,msg,len,flags); }
 static ABI int32_t net_sendto(int s,const void *msg,size_t len,int flags,const void *to,uint32_t tolen) {
-    /* The game's code that sends, for the network summary's list of senders. */
-    return runtime_net_sendto_from(s,msg,len,flags,(const OrbisNetSockaddr*)to,tolen,__builtin_return_address(0));
+    /* The game's code that sends and its frame (the caller's rbp, saved by this function's
+     * prologue), for the network summary's senders and their call chains. */
+    return runtime_net_sendto_from(s,msg,len,flags,(const OrbisNetSockaddr*)to,tolen,__builtin_return_address(0),
+                                   *(void *const *)__builtin_frame_address(0));
 }
 static ABI int32_t net_recv(int s,void *buf,size_t len,int flags) { return runtime_net_recv(s,buf,len,flags); }
 static ABI int32_t net_recvfrom(int s,void *buf,size_t len,int flags,void *from,uint32_t *fromlen) { return runtime_net_recvfrom(s,buf,len,flags,(OrbisNetSockaddr*)from,fromlen); }
