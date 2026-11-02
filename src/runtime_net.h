@@ -114,8 +114,8 @@ int32_t runtime_net_listen(int s, int backlog);
 int32_t runtime_net_accept(int s, OrbisNetSockaddr *addr, uint32_t *addrlen);
 int32_t runtime_net_send(int s, const void *msg, size_t len, int flags);
 int32_t runtime_net_sendto(int s, const void *msg, size_t len, int flags, const OrbisNetSockaddr *to, uint32_t tolen);
-/* The same, with the game's code address that sent it and the caller's frame pointer (the network
- * summary's senders and their call chains). */
+/* The same, with the game's code address that sent it and the frame of the function the game called
+ * (the network summary's senders and their call chains; the chain scan starts there). */
 int32_t runtime_net_sendto_from(int s, const void *msg, size_t len, int flags, const OrbisNetSockaddr *to, uint32_t tolen,
                                 const void *caller, const void *frame);
 int32_t runtime_net_recv(int s, void *buf, size_t len, int flags);

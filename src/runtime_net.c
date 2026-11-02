@@ -89,7 +89,7 @@ int32_t runtime_net_init(void) {
 #endif
         net_overrides_init();
         g_net_initialized = 1;
-        runtime_net_trace("sceNetInit completed (NET-PATCH v8: peeks kept, per-player summary, one copy per datagram, one player per address, corrected and slewed wall clock, clock, sender and send-chain diagnostics)");
+        runtime_net_trace("sceNetInit completed (NET-PATCH v9: peeks kept, per-player summary, one copy per datagram, one player per address, corrected and slewed wall clock, clock, sender and send-chain (stack scan) diagnostics)");
         clock_check_start();
     }
     runtime_friends_start();
@@ -1079,13 +1079,18 @@ static void code_where(uintptr_t address, char *out, size_t cap) {
         snprintf(out, cap, "0x%llx", (unsigned long long)address);
 }
 
-/* The call chain of each send to a player: the return addresses up the game's frame-pointer chain
- * (its code keeps rbp frames), each frame checked against this thread's stack and the game image,
- * so the walk stops at the first frame that is not one. Each distinct chain is logged once in full
- * and then counted per summary: the way from the game's network update to sendto, to find what
- * paces it (~13 rounds a second). */
+/* The call chain of each send to a player: the return addresses into the game's code above this
+ * call on its stack, found by scanning the stack (as profilers do) rather than by following frame
+ * pointers, which 64-bit Windows code may keep at an offset inside its frames (net6's frame walk
+ * stopped at the first frame there). A stack word counts when it points into the game image just
+ * after a call instruction (call rel32, call [rip+disp32], call reg, call [reg+disp]); the scan
+ * stays inside this thread's committed stack (VirtualQuery) and 64 KiB. A stale return address
+ * left in a frame's locals can show up too, so a chain is a strong hint, not a proof. Each
+ * distinct chain is logged once in full and then counted per summary: the way from the game's
+ * network update to sendto, to find what paces it (~13 rounds a second). */
 #define STACK_DEPTH 16
 #define STACKS_MAX 16
+#define STACK_SCAN_BYTES 65536u
 
 typedef struct {
     uint64_t hash;
@@ -1096,21 +1101,13 @@ typedef struct {
 
 static SendStack g_stacks[STACKS_MAX];
 
-static int stack_bounds(uintptr_t *lo, uintptr_t *hi) {
+/* The end (highest address) of the stack memory that holds here. */
+static int stack_end(uintptr_t here, uintptr_t *end) {
 #ifdef _WIN32
-    typedef VOID (WINAPI *Limits)(PULONG_PTR, PULONG_PTR);
-    static Limits limits;
-    static int looked;
-    if (!looked) {
-        limits = (Limits)(void (*)(void))GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetCurrentThreadStackLimits");
-        looked = 1;
-    }
-    if (!limits) return 0;
-    ULONG_PTR low = 0, high = 0;
-    limits(&low, &high);
-    *lo = (uintptr_t)low;
-    *hi = (uintptr_t)high;
-    return high > low;
+    MEMORY_BASIC_INFORMATION m;
+    if (!VirtualQuery((const void *)here, &m, sizeof(m)) || m.State != MEM_COMMIT) return 0;
+    *end = (uintptr_t)m.BaseAddress + m.RegionSize;
+    return *end > here;
 #else
     pthread_attr_t a;
     void *base = NULL;
@@ -1119,25 +1116,40 @@ static int stack_bounds(uintptr_t *lo, uintptr_t *hi) {
     const int ok = !pthread_attr_getstack(&a, &base, &size);
     pthread_attr_destroy(&a);
     if (!ok) return 0;
-    *lo = (uintptr_t)base;
-    *hi = (uintptr_t)base + size;
-    return 1;
+    *end = (uintptr_t)base + size;
+    return *end > here;
 #endif
 }
 
-/* The return addresses above frame (the caller's rbp), at most max. */
-static int guest_chain(const void *frame, uintptr_t *out, int max) {
-    uintptr_t lo, hi;
-    if (!frame || !g_image || !stack_bounds(&lo, &hi)) return 0;
-    const uintptr_t code_lo = (uintptr_t)g_image, code_hi = (uintptr_t)g_image + g_image_size;
-    uintptr_t fp = (uintptr_t)frame;
+/* A return address into the game: in the image, just after a call instruction. */
+static int game_return(uintptr_t w) {
+    const uintptr_t lo = (uintptr_t)g_image, hi = (uintptr_t)g_image + g_image_size;
+    if (w < lo + 8 || w >= hi) return 0;
+    const uint8_t *p = (const uint8_t *)w;
+    if (p[-5] == 0xe8) return 1;                                   /* call rel32 */
+    if (p[-6] == 0xff && (p[-5] & 0x38) == 0x10) return 1;         /* call [rip+disp32] / [reg+disp32] */
+    if (p[-2] == 0xff && (p[-1] & 0xf8) == 0xd0) return 1;         /* call reg */
+    if (p[-3] == 0xff && (p[-2] & 0x38) == 0x10 && (p[-2] & 0xc0) == 0x40) return 1; /* call [reg+disp8] */
+    return 0;
+}
+
+/* The game's return addresses above start (the frame of the function the game called; this frame
+ * when there is none), at most max, each once; skip (the sender, already first) is left out. */
+static int guest_chain(const void *start, uintptr_t skip, uintptr_t *out, int max) {
+    volatile uintptr_t marker = 0;
+    uintptr_t here = ((uintptr_t)&marker + 7) & ~(uintptr_t)7;
+    uintptr_t end;
+    if (!g_image || !stack_end(here, &end)) return 0;
+    const uintptr_t from = ((uintptr_t)start + 7) & ~(uintptr_t)7;
+    if (start && from > here && from < end) here = from; /* above the port's own frames */
+    if (end - here > STACK_SCAN_BYTES) end = here + STACK_SCAN_BYTES;
     int n = 0;
-    while (n < max && !(fp & 7) && fp >= lo && fp + 16 <= hi) {
-        const uintptr_t next = ((const uintptr_t *)fp)[0], ret = ((const uintptr_t *)fp)[1];
-        if (ret < code_lo || ret >= code_hi) break;
-        out[n++] = ret;
-        if (next <= fp) break;
-        fp = next;
+    for (uintptr_t at = here; at + 8 <= end && n < max; at += 8) {
+        const uintptr_t w = *(const uintptr_t *)at;
+        if (!game_return(w) || w == skip) continue;
+        int seen = 0;
+        for (int k = 0; k < n && !seen; k++) seen = out[k] == w;
+        if (!seen) out[n++] = w;
     }
     return n;
 }
@@ -1194,7 +1206,7 @@ static void sendsite_on_send(const void *caller, const void *frame, const struct
     const uint64_t now = now_ms();
     uintptr_t chain[STACK_DEPTH];
     chain[0] = (uintptr_t)caller;
-    const int depth = 1 + guest_chain(frame, chain + 1, STACK_DEPTH - 1);
+    const int depth = 1 + guest_chain(frame, (uintptr_t)caller, chain + 1, STACK_DEPTH - 1);
     while (atomic_flag_test_and_set_explicit(&g_sendsite_lock, memory_order_acquire)) {}
     stack_note(chain, depth);
     SendSite *s = NULL;
