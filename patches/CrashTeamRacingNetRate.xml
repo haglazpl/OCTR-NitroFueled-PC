@@ -10,6 +10,15 @@
      15. The send rate itself (and what the game derives from it: the 2/15 s interpolation delay) is
      unchanged. ExpectedSHA256 checks the original instruction (C5 FA 10 0D E9 F4 25 01) first, so
      another build skips it. net8's patches of 0x20A7AEC changed another, unrelated timer. -->
+<!-- Interpolation delay (same game, same check of the original instruction).
+     Each frame the game shows the other players as they were a fixed time ago (eboot 0x4333f0 + 0x400000, reached
+     through 0x3ee040): it takes the time now, in 1/8192 s, subtracts (2 / send rate) * 8192, and has
+     every replicated object apply its state at that moment (0x433550, the components' interpolation).
+     2 / 15 s = 133 ms: two of the game's original update intervals, so that the next update is always
+     there to slide towards. The patch makes the multiply by 8192.0 at 0x833471
+     (vmulss xmm0,xmm0,[rip+disp]) use the game's 4096.0 constant instead, so the delay is 67 ms: two
+     update intervals at 30 a second. The send rate and the connection monitor that compares the RTT
+     with the delay (0x4340d0) keep the original 133 ms value. -->
 <Patch>
     <TitleID>
         <ID>CUSA13795</ID>
@@ -24,6 +33,18 @@
         <PatchList>
             <!-- vmovss xmm1,[rip+disp]: loads 0.375 (at 0x2078AA0) instead of 1.0 -->
             <Line Type="bytes" Address="0x00E4797B" Value="C5FA100D1D112301" ExpectedSHA256="60c41fb379734ef949af35e00303a7fd4b3b989f9a58a80101718163e44ba3b5"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Crash Team Racing Nitro-Fueled"
+              Name="Online: other karts shown 67 ms behind (needs 30 updates for everyone)"
+              Note="The game shows the other players as they were 133 ms ago (on top of the ping), so that it always has the next update to slide them towards: two updates at the game's original 15 a second. This makes it 67 ms: two updates at 30 a second, so the karts and weapons you see are 67 ms closer to where they really are. Use it only when everyone in the room has the 30 network updates patch on: a player sending 15 a second would move in jerks."
+              Author="haglazpl (OCTR-NitroFueled-PC fork)"
+              PatchVer="1.0"
+              AppVer="01.21"
+              AppElf="eboot.bin">
+        <PatchList>
+            <!-- vmulss xmm0,xmm0,[rip+disp]: multiplies by 4096.0 (at 0x20483F8) instead of 8192.0 -->
+            <Line Type="bytes" Address="0x00833471" Value="C5FA59057F4F8101" ExpectedSHA256="db86b98b45f2ec69cc899f32f86b0bc836ae2be7748dc8f90899297fdf554eba"/>
         </PatchList>
     </Metadata>
 </Patch>
