@@ -1248,7 +1248,7 @@ static void sendsite_on_send(const void *caller, uintptr_t guest_rbp, const stru
         if (!g_sendsites[i].caller || g_sendsites[i].caller == (uintptr_t)caller) s = &g_sendsites[i];
     if (s) {
         s->caller = (uintptr_t)caller;
-        if (!s->thread[0]) snprintf(s->thread, sizeof(s->thread), "%s", thread);
+        snprintf(s->thread, sizeof(s->thread), "%s", thread); /* the latest */
         s->packets++;
         s->bytes += (uint32_t)len;
         if (len > s->max_len) s->max_len = (uint32_t)len;

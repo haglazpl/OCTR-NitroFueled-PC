@@ -1,45 +1,29 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- The game's network update rate (USA 1.21, CUSA13795).
-     The race-state sender (eboot 0xb8f700 + 0x400000) adds each frame's time to a timer and sends when
-     it reaches the float constant at 0x20A7AEC (1/15 s; only this function reads it), then sets the
-     timer to 0. At 60 FPS that is 4 or 5 frames, 13.3 sends a second (the logs: 66-85 ms, 75 on average).
-     Each patch rewrites that constant; ExpectedSHA256 checks the original 1/15 (89 88 88 3D) first, so
-     another build skips it. Found with the net3-net7 sender logs and a disassembly of the eboot. -->
+     The game's thread "Network PostUpdate" runs once per frame. Its update (eboot 0xa478e0 + 0x400000)
+     adds the frame's time to a timer and, when the timer reaches 1.0 / the network settings' send rate
+     (15 a second), sends this PC's state to every player (0x436c30) and sets the timer to 0. At 60 FPS
+     that is 4 or 5 frames: 13.3 sends a second (the logs: 66-85 ms, 75 on average). Found with net9's
+     send chains (frame-pointer walks): every race send comes from that thread through 0xa47890.
+     The patch makes the instruction that loads the 1.0 (0xE4797B, vmovss xmm1,[rip+disp]) load a
+     smaller constant from the game's read-only data instead, so the threshold becomes that constant /
+     15. The send rate itself (and what the game derives from it: the 2/15 s interpolation delay) is
+     unchanged. ExpectedSHA256 checks the original instruction (C5 FA 10 0D E9 F4 25 01) first, so
+     another build skips it. net8's patches of 0x20A7AEC changed another, unrelated timer. -->
 <Patch>
     <TitleID>
         <ID>CUSA13795</ID>
     </TitleID>
     <Metadata Title="Crash Team Racing Nitro-Fueled"
-              Name="Online: 15 network updates per second"
-              Note="The game sends each player's race state when a timer passes 1/15 s and then resets the timer to 0, so at 60 FPS a send waits 4 or 5 frames: 13.3 updates a second, and weapon events wait for the next one. This sets the timer to 0.06 s: a send every 4 frames at 60 FPS, 15 a second. It changes what this PC sends; everyone in the room should use the same one. Turn on only one of the network-rate patches."
-              Author="haglazpl (OCTR-NitroFueled-PC fork)"
-              PatchVer="1.0"
-              AppVer="01.21"
-              AppElf="eboot.bin">
-        <PatchList>
-            <Line Type="float32" Address="0x20A7AEC" Value="0.06" ExpectedSHA256="caaaa24cfd5af89f2d9429b2d59d05464d14c47dc57d14f22ca9b44254f765ff"/>
-        </PatchList>
-    </Metadata>
-    <Metadata Title="Crash Team Racing Nitro-Fueled"
-              Name="Online: 20 network updates per second"
-              Note="The game sends each player's race state when a timer passes 1/15 s and then resets the timer to 0, so at 60 FPS a send waits 4 or 5 frames: 13.3 updates a second, and weapon events wait for the next one. This sets the timer to 0.045 s: a send every 3 frames at 60 FPS, 20 a second. It changes what this PC sends; everyone in the room should use the same one. Turn on only one of the network-rate patches."
-              Author="haglazpl (OCTR-NitroFueled-PC fork)"
-              PatchVer="1.0"
-              AppVer="01.21"
-              AppElf="eboot.bin">
-        <PatchList>
-            <Line Type="float32" Address="0x20A7AEC" Value="0.045" ExpectedSHA256="caaaa24cfd5af89f2d9429b2d59d05464d14c47dc57d14f22ca9b44254f765ff"/>
-        </PatchList>
-    </Metadata>
-    <Metadata Title="Crash Team Racing Nitro-Fueled"
               Name="Online: 30 network updates per second"
-              Note="The game sends each player's race state when a timer passes 1/15 s and then resets the timer to 0, so at 60 FPS a send waits 4 or 5 frames: 13.3 updates a second, and weapon events wait for the next one. This sets the timer to 0.03 s: a send every 2 frames at 60 FPS, 30 a second. It changes what this PC sends; everyone in the room should use the same one. Turn on only one of the network-rate patches."
+              Note="The game sends this PC's race state to the other players when a timer passes 1/15 s and then resets the timer to 0, so at 60 FPS a send waits 4 or 5 frames: 13.3 updates a second, and weapon events wait for the next one. This sends when the timer passes 25 ms: every 2 frames at 60 FPS, 30 a second. It changes only what this PC sends, so it works even if others don't use it; the more players use it, the better."
               Author="haglazpl (OCTR-NitroFueled-PC fork)"
-              PatchVer="1.0"
+              PatchVer="2.0"
               AppVer="01.21"
               AppElf="eboot.bin">
         <PatchList>
-            <Line Type="float32" Address="0x20A7AEC" Value="0.03" ExpectedSHA256="caaaa24cfd5af89f2d9429b2d59d05464d14c47dc57d14f22ca9b44254f765ff"/>
+            <!-- vmovss xmm1,[rip+disp]: loads 0.375 (at 0x2078AA0) instead of 1.0 -->
+            <Line Type="bytes" Address="0x00E4797B" Value="C5FA100D1D112301" ExpectedSHA256="60c41fb379734ef949af35e00303a7fd4b3b989f9a58a80101718163e44ba3b5"/>
         </PatchList>
     </Metadata>
 </Patch>
