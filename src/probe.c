@@ -1234,6 +1234,7 @@ int main(int argc, char **argv) {
     if (!runtime_public_itemless_start(image, size)) fail("native public Itemless callbacks could not be installed");
     if (!runtime_time_trial_start(image, size)) fail("Time Trial challenge callback could not be installed");
     if (!runtime_itemless_start(image, size)) fail("native Itemless collision callback could not be installed");
+    runtime_item_trace_start(image, size);
     runtime_net_set_image(image, size);
     for (uint64_t i = 0; i < ns; ++i)
         if (segments[i].flags & 1) runtime_net_add_code(image + segments[i].address, segments[i].size);

@@ -89,7 +89,7 @@ int32_t runtime_net_init(void) {
 #endif
         net_overrides_init();
         g_net_initialized = 1;
-        runtime_net_trace("sceNetInit completed (NET-PATCH v11: peeks kept, per-player summary, one copy per datagram, one player per address, corrected and slewed wall clock, clock, sender threads and send chains by the game's frame pointers (BB_NET_SEND_CHAINS=0 turns them off))");
+        runtime_net_trace("sceNetInit completed (NET-PATCH v12: peeks kept, per-player summary, one copy per datagram, one player per address, corrected and slewed wall clock, clock, sender threads and send chains by the game's frame pointers (BB_NET_SEND_CHAINS=0 turns them off), fake lag test switch (BB_NET_FAKE_LAG_MS))");
         clock_check_start();
     }
     runtime_friends_start();
@@ -1549,6 +1549,103 @@ int32_t runtime_net_send(int s, const void *msg, size_t len, int flags) {
     return ret;
 }
 
+/* ---- Fake lag (net12 test switch) ----------------------------------------------------------
+ * BB_NET_FAKE_LAG_MS=<1-1000> holds every game packet this PC sends to the other players that long
+ * before sending it (packets to the RyuNET server go at once): this PC's ping to everyone grows by
+ * that much, to reproduce high-ping item hits with players nearby. The game is told the packet
+ * went; a thread sends the held packets in order. */
+typedef struct HeldSend {
+    struct HeldSend *next;
+    uint64_t due;
+    int s, flags;
+    OrbisNetSockaddrIn to;
+    size_t len;
+    const void *caller;
+    unsigned char data[];
+} HeldSend;
+
+static pthread_mutex_t g_lag_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_lag_wake = PTHREAD_COND_INITIALIZER;
+static HeldSend *g_lag_head, *g_lag_tail;
+static _Thread_local int g_lag_sender;
+
+static int fake_lag_ms(void) {
+    static int ms = -1;
+    if (ms < 0) {
+        const char *v = getenv("BB_NET_FAKE_LAG_MS");
+        int n = v ? atoi(v) : 0;
+        if (n < 0) n = 0;
+        if (n > 1000) n = 1000;
+        ms = n;
+        if (ms) runtime_net_trace("Net FAKE LAG: every packet to the other players leaves %d ms late (BB_NET_FAKE_LAG_MS)", ms);
+    }
+    return ms;
+}
+
+static void lag_sleep_ms(unsigned ms) {
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    usleep(ms * 1000u);
+#endif
+}
+
+static void *lag_thread(void *arg) {
+    (void)arg;
+    g_lag_sender = 1;
+    for (;;) {
+        pthread_mutex_lock(&g_lag_lock);
+        while (!g_lag_head) pthread_cond_wait(&g_lag_wake, &g_lag_lock);
+        HeldSend *h = g_lag_head;
+        const uint64_t now = now_ms();
+        if (h->due > now) {
+            pthread_mutex_unlock(&g_lag_lock);
+            const uint64_t wait = h->due - now;
+            lag_sleep_ms(wait > 5 ? 5u : (unsigned)wait);
+            continue;
+        }
+        g_lag_head = h->next;
+        if (!g_lag_head) g_lag_tail = NULL;
+        pthread_mutex_unlock(&g_lag_lock);
+        runtime_net_sendto_from(h->s, h->data, h->len, h->flags, (const OrbisNetSockaddr *)&h->to, sizeof(h->to),
+                                h->caller, 0);
+        free(h);
+    }
+    return NULL;
+}
+
+/* 1: the packet is held (sent later by the lag thread). */
+static int lag_hold(int s, const void *msg, size_t len, int flags, const OrbisNetSockaddr *to, const void *caller) {
+    static int started;
+    HeldSend *h = malloc(sizeof(*h) + len);
+    if (!h) return 0;
+    h->next = NULL;
+    h->due = now_ms() + (uint64_t)fake_lag_ms();
+    h->s = s;
+    h->flags = flags;
+    memcpy(&h->to, to, sizeof(h->to));
+    h->len = len;
+    h->caller = caller;
+    memcpy(h->data, msg, len);
+    pthread_mutex_lock(&g_lag_lock);
+    if (!started) {
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, lag_thread, NULL) != 0) {
+            pthread_mutex_unlock(&g_lag_lock);
+            free(h);
+            return 0;
+        }
+        pthread_detach(thread);
+        started = 1;
+    }
+    if (g_lag_tail) g_lag_tail->next = h;
+    else g_lag_head = h;
+    g_lag_tail = h;
+    pthread_cond_signal(&g_lag_wake);
+    pthread_mutex_unlock(&g_lag_lock);
+    return 1;
+}
+
 int32_t runtime_net_sendto(int s, const void *msg, size_t len, int flags, const OrbisNetSockaddr *to, uint32_t tolen) {
     return runtime_net_sendto_from(s, msg, len, flags, to, tolen, NULL, 0);
 }
@@ -1573,6 +1670,11 @@ int32_t runtime_net_sendto_from(int s, const void *msg, size_t len, int flags, c
         runtime_net_pkt_trace("sceNetSendto(fd=%d, len=%zu, to=%s:%u)", s, len, inet_ntoa(sin.sin_addr), ntohs(sin.sin_port));
     } else {
         runtime_net_pkt_trace("sceNetSendto(fd=%d, len=%zu)", s, len);
+    }
+    if (to && vs->tunnel && !g_lag_sender && fake_lag_ms()) {
+        struct sockaddr_in server;
+        if (!(tunnel_server(&server) && sin.sin_addr.s_addr == server.sin_addr.s_addr) && lag_hold(s, msg, len, flags, to, caller))
+            return (int32_t)len;
     }
 
     int ret = sendto(vs->s, (const char *)msg, (int)len, win_flags,

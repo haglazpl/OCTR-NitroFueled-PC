@@ -130,6 +130,8 @@ void runtime_race_options_leave_room(void);
 void runtime_race_options_map_loading(const char *map);
 int runtime_race_options_start(unsigned char *image, size_t size);
 int runtime_itemless_start(unsigned char *image, size_t size);
+/* Item-hit diagnostics: "[ITEM]" log lines for potion touches, impacts and kart damage (BB_ITEM_TRACE=0: off). */
+int runtime_item_trace_start(unsigned char *image, size_t size);
 /* Clock use by the game, for the network summary's diagnostics (runtime_kernel.c, runtime_rtc.c):
  * counts of the game's calls since the previous take, which resets them. */
 typedef struct {
