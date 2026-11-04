@@ -86,7 +86,9 @@ static void describe(void *entity, char *out, size_t cap) {
         snprintf(out, cap, "nothing");
         return;
     }
-    void *racer = find_racer && racers && *racers ? find_racer(*racers, entity) : NULL;
+    /* find_racer reads the entity's component list (CEntity _components, +0x18): an entity being
+     * torn down has none, and the game's lookup would read through a null pointer. */
+    void *racer = find_racer && racers && *racers && ptr_at(entity, 0x18) ? find_racer(*racers, entity) : NULL;
     const int auth = has_authority(entity);
     if (!racer) {
         snprintf(out, cap, "an object (owned by %s)", auth ? "this PC" : "another PC");
@@ -141,13 +143,14 @@ static uint64_t ABI touch(void *self, uint64_t other, uint64_t flag, uint64_t a3
     float p[3], k[3];
     position(potion, p);
     position((void *)(uintptr_t)other, k);
+    char who[96];
+    describe((void *)(uintptr_t)other, who, sizeof who); /* before: the touch may remove what it touched */
+    const int owner = has_authority(potion);
     const uint64_t r = orig_touch(self, other, flag, a3, a4, a5);
     int after = -1;
     if (self) memcpy(&after, (unsigned char *)self + 0xc0, sizeof after);
-    char who[96];
-    describe((void *)(uintptr_t)other, who, sizeof who);
     item_log("potion touch check on this PC: potion %p (owned by %s, %s -> %s) at (%.1f %.1f %.1f); touched by %s at (%.1f %.1f %.1f), %.1f apart; flag %d",
-             potion, has_authority(potion) == 1 ? "this PC" : "another PC", state_name(before), state_name(after),
+             potion, owner == 1 ? "this PC" : "another PC", state_name(before), state_name(after),
              p[0], p[1], p[2], who, k[0], k[1], k[2], distance(p, k), (int)flag);
     return r;
 }
@@ -155,15 +158,16 @@ static uint64_t ABI touch(void *self, uint64_t other, uint64_t flag, uint64_t a3
 /* COnPowerUpImpact sent to an entity (the potion's touch, or another power-up's hit). */
 static uint64_t ABI impact(void *impactable, uint64_t kind, uint64_t powerup, uint64_t owner, uint64_t a4, uint64_t a5) {
     void *target = impactable ? ptr_at(impactable, 0x18) : NULL;
-    const uint64_t r = orig_impact(impactable, kind, powerup, owner, a4, a5);
     char who[96];
     describe(target, who, sizeof who);
     float t[3], p[3];
     position(target, t);
     position((void *)(uintptr_t)powerup, p);
+    const int powerup_owner = has_authority((void *)(uintptr_t)powerup);
+    const uint64_t r = orig_impact(impactable, kind, powerup, owner, a4, a5);
     item_log("power-up impact sent on this PC: kind %d to %s at (%.1f %.1f %.1f), power-up %p (owned by %s) %.1f away -> %s",
              (int)kind, who, t[0], t[1], t[2], (void *)(uintptr_t)powerup,
-             has_authority((void *)(uintptr_t)powerup) == 1 ? "this PC" : "another PC", distance(t, p),
+             powerup_owner == 1 ? "this PC" : "another PC", distance(t, p),
              (r & 0xff) ? "accepted" : "ignored");
     return r;
 }
@@ -173,9 +177,9 @@ static uint64_t ABI set_state(void *self, uint64_t state, uint64_t a2, uint64_t 
     if (self) memcpy(&before, (unsigned char *)self + 0xc0, sizeof before);
     const int net = from_network;
     from_network = 0;
+    void *potion = self ? ptr_at(self, 0x18) : NULL;
     const uint64_t r = orig_state(self, state, a2, a3, a4, a5);
     if (before != (int)state && self) {
-        void *potion = ptr_at(self, 0x18);
         float p[3], e[3];
         position(potion, p);
         memcpy(e, (unsigned char *)self + 0xa8, sizeof e); /* _explosionPosition */
@@ -201,13 +205,15 @@ static uint64_t ABI net_set_state(void *self, uint64_t state, uint64_t a2, uint6
 
 static uint64_t ABI damage(void *self, uint64_t type, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     void *kart = self ? ptr_at(self, 0x18) : NULL;
-    const uint64_t r = orig_damage(self, type, a2, a3, a4, a5);
     const int t = (int)type;
+    char who[96];
+    float k[3];
     if (t >= 0 && t <= 10) {
-        char who[96];
-        float k[3];
         describe(kart, who, sizeof who);
         position(kart, k);
+    }
+    const uint64_t r = orig_damage(self, type, a2, a3, a4, a5);
+    if (t >= 0 && t <= 10) {
         item_log("damage starts on this PC: %s for %s at (%.1f %.1f %.1f)", damage_type[t], who, k[0], k[1], k[2]);
     }
     return r;
