@@ -118,6 +118,7 @@ typedef struct {
     SOCKET s;
     int in_use;
     int is_stream;
+    int matchmaking;
     int non_blocking;
     int tunnel; /* the game's UDP socket (port 3074): runtime_net_tunnel.h */
     char name[32];
@@ -131,6 +132,7 @@ static VSocket g_sockets[MAX_VIRTUAL_SOCKETS];
 static struct { int fd; int len; struct sockaddr_in from; uint8_t data[2048]; } g_peeked;
 static uint64_t now_ms(void);
 static int tunnel_server(struct sockaddr_in *out);
+static int from_server(const struct sockaddr_in *from, const struct sockaddr_in *server);
 /* The WebAPI invitation session can remain active in Arcade. A private race
  * with another player has game UDP traffic to that peer before track assets
  * load; Arcade has only server traffic. Let old peer activity expire when the
@@ -146,7 +148,7 @@ int runtime_net_private_lobby_active(void) {
 static void note_game_peer(const VSocket *vs, const struct sockaddr_in *peer) {
     struct sockaddr_in server;
     if (!vs->tunnel || !peer || !tunnel_server(&server) ||
-        peer->sin_addr.s_addr == server.sin_addr.s_addr) return;
+        from_server(peer, &server)) return;
     const uint64_t now = now_ms();
     const uint64_t old = __atomic_exchange_n(&g_last_game_peer_ms, now, __ATOMIC_RELEASE);
     if (!old || now - old >= 5000) runtime_net_trace("Speed: game peer active");
@@ -260,6 +262,7 @@ int32_t runtime_net_socket_close(int s) {
 
     runtime_net_trace("sceNetSocketClose(fd=%d)", s);
     if (g_peeked.fd == s) g_peeked.fd = 0;
+    if (vs->matchmaking) runtime_public_itemless_reset();
     closesocket(vs->s);
     vsocket_free(s);
     return ORBIS_OK;
@@ -287,6 +290,7 @@ int32_t runtime_net_connect(int s, const OrbisNetSockaddr *addr, uint32_t addrle
     inet_ntop(AF_INET, &sin.sin_addr, ip_str, sizeof(ip_str));
     runtime_net_trace("sceNetConnect(fd=%d, to=%s:%u)", s, ip_str, ntohs(sin.sin_port));
 
+    vs->matchmaking = vs->is_stream && ntohs(sin.sin_port) >= 3074 && ntohs(sin.sin_port) <= 3080;
     int ret = connect(vs->s, (struct sockaddr *)&sin, sizeof(sin));
     if (ret != 0) {
         int err = WSAGetLastError();
@@ -1611,12 +1615,14 @@ int32_t runtime_net_recv(int s, void *buf, size_t len, int flags) {
             return -1;
         }
         g_net_errno = net_errno_from(err);
+        if (vs->matchmaking) runtime_public_itemless_reset();
         runtime_net_trace("sceNetRecv(fd=%d, len=%zu, flags=0x%x) -> err %d (wsa %d)", s, len, flags, g_net_errno, err);
         return -1;
     }
     if (ret > 0) {
         runtime_net_pkt_trace("sceNetRecv(fd=%d, len=%zu) -> %d bytes (first=0x%02X)", s, len, ret, ((unsigned char *)buf)[0]);
     } else {
+        if (vs->matchmaking) runtime_public_itemless_reset();
         runtime_net_pkt_trace("sceNetRecv(fd=%d) -> EOF (0 bytes)", s);
     }
     return ret;
