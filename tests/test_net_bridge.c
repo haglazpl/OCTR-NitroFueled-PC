@@ -6,6 +6,24 @@
 #include <assert.h>
 #include <fcntl.h>
 
+/* The fork's network diagnostics (per-player summary, send chains) read the game's clocks and
+ * thread names from the runtime, which these tests do not link. */
+void runtime_kernel_clock_take(RuntimeClockCounts *out) { memset(out, 0, sizeof *out); }
+int runtime_rtc_clock_take(uint64_t *network_ticks, uint64_t *current_ticks, uintptr_t *callers, uint32_t *counts, int max) {
+    (void)callers, (void)counts, (void)max;
+    *network_ticks = *current_ticks = 0;
+    return 0;
+}
+int runtime_clock_callers_take(int *kinds, uintptr_t *callers, uint32_t *counts, int max) {
+    (void)kinds, (void)callers, (void)counts, (void)max;
+    return 0;
+}
+int runtime_tsc_check(uint64_t *given_hz, double *measured_hz, double *seconds) {
+    (void)given_hz, (void)measured_hz, (void)seconds;
+    return 0;
+}
+const char *runtime_thread_current_name(void) { return NULL; }
+
 static int bind_udp(uint16_t *port) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     assert(fd >= 0);

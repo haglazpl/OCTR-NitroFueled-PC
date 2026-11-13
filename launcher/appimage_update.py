@@ -16,7 +16,7 @@ import re
 import urllib.request
 from pathlib import Path
 
-REPO = "Ryu7w7/OCTR-NitroFueled-PC"
+REPO = "haglazpl/OCTR-NitroFueled-PC"  # haglazpl's fork (releases v<version>-net<N>)
 LATEST = f"https://api.github.com/repos/{REPO}/releases/latest"
 RELEASES_PAGE = f"https://github.com/{REPO}/releases/latest"
 ASSET = re.compile(r"^SacredFire(?:-.+)?-x86_64\.AppImage$")
@@ -24,7 +24,8 @@ ASSET = re.compile(r"^SacredFire(?:-.+)?-x86_64\.AppImage$")
 
 def parse_version(text):
     """(major, minor, patch, stage) of "v0.5.4", "v0.5.4-linux" or a git describe
-    "v0.5.4-3-gabc123-dirty"; stage 0 a pre-release suffix, 1 the release, 2 commits after it.
+    "v0.5.4-3-gabc123-dirty"; stage 0 a pre-release suffix, 1 the release, 2 commits after it,
+    3 a fork release "v0.5.4-net2" (then its N and the commits after it, else 0, 0).
     None when it is not a version."""
     m = re.match(r"^\s*[vV]?(\d{1,5})\.(\d{1,5})(?:\.(\d{1,5}))?(.*?)\s*$", text or "")
     if not m:
@@ -37,8 +38,19 @@ def parse_version(text):
                 break
         else:
             break
-    stage = 1 if not suffix else 2 if re.fullmatch(r"-\d+-g[0-9a-fA-F]+", suffix) else 0
-    return int(m.group(1)), int(m.group(2)), int(m.group(3) or 0), stage
+    build = commits = 0
+    if not suffix:
+        stage = 1
+    elif re.fullmatch(r"-\d+-g[0-9a-fA-F]+", suffix):
+        stage = 2
+    else:
+        # The fork"s releases: -net<N> on top of Ryu7w7"s version, -net<N>-<n>-g<hash> after one.
+        fork = re.fullmatch(r"-net(\d{1,9})(?:-(\d{1,9})-g[0-9a-fA-F]+)?", suffix)
+        if fork and int(fork.group(1)) > 0:
+            stage, build, commits = 3, int(fork.group(1)), int(fork.group(2) or 0)
+        else:
+            stage = 0
+    return int(m.group(1)), int(m.group(2)), int(m.group(3) or 0), stage, build, commits
 
 
 def is_newer(have, latest):

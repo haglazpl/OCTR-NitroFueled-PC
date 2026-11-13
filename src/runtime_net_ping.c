@@ -155,6 +155,21 @@ int ping_view(uint64_t now_ms, PingPeer *out, int max) {
     return n;
 }
 
+int ping_peer(uint32_t ip, uint16_t port, uint64_t now_ms, char *name) {
+    int ms = PING_NOT_TRACKED;
+    if (name) name[0] = '\0';
+    take();
+    const PingSlot *s = slot_for(ip, port, 0);
+    if (s) {
+        if (name) memcpy(name, s->name, PING_NAME);
+        ms = !s->capable                                                     ? PING_OLDER_PORT
+             : s->last_answer && now_ms - s->last_answer <= PING_FRESH_MS ? s->ms
+                                                                             : PING_NO_ANSWER;
+    }
+    give();
+    return ms;
+}
+
 int ping_peer_name(uint32_t ip, uint16_t port, uint64_t now, char out[PING_NAME]) {
     int found=0; out[0]=0;
     take();

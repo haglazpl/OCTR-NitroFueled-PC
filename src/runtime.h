@@ -50,6 +50,8 @@ void runtime_set_procparam(void *param);
 void **runtime_application_heap_api(void);
 uintptr_t runtime_thread_resolve(const char *name);
 void runtime_thread_report(void);
+/* The name the game gave the calling thread (NULL on the port's own threads). */
+const char *runtime_thread_current_name(void);
 void runtime_set_main_tls(const void *data, uint64_t filesz, uint64_t memsz, uint64_t align);
 void runtime_thread_attach_main(void);
 int32_t *runtime_errno(void);
@@ -147,6 +149,39 @@ void runtime_race_options_map_loading(const char *map);
 int runtime_race_options_start(unsigned char *image, size_t size);
 void runtime_race_options_stop_boost(void *boost, void (ABI *stop)(void *));
 int runtime_itemless_start(unsigned char *image, size_t size);
+/* Item-hit diagnostics: "[ITEM]" log lines for potion touches, impacts and kart damage (BB_ITEM_TRACE=0: off). */
+int runtime_item_trace_start(unsigned char *image, size_t size);
+/* Clock use by the game, for the network summary's diagnostics (runtime_kernel.c, runtime_rtc.c):
+ * counts of the game's calls since the previous take, which resets them. */
+typedef struct {
+    uint64_t tsc_reads, tsc_frequency, process_time, process_counter, clock_gettime, gettimeofday, time;
+    uint64_t clock_ids; /* bit n: clock_gettime(n) was read */
+} RuntimeClockCounts;
+void runtime_kernel_clock_take(RuntimeClockCounts *out);
+/* The wall clock the game reads (gettimeofday, the realtime clocks, time(), the RTC), in microseconds
+ * since 1970: the monotonic clock plus a base taken at the first read from this PC's clock and the
+ * time servers' offset run.py measured (BB_CLOCK_OFFSET_US). BB_CLOCK_FIX=0: this PC's clock as is. */
+int64_t runtime_wall_now_us(void);
+/* Moves the game's wall clock by delta microseconds (runtime_net.c's periodic check slews it). */
+void runtime_wall_adjust_us(int64_t delta);
+/* The game's wall clock minus this PC's, in microseconds (for the log). */
+int64_t runtime_wall_offset_us(void);
+/* 0 with BB_CLOCK_FIX=0: the game reads this PC's clock as is. */
+int runtime_wall_fixed(void);
+/* The game's code that read the wall clock since the previous take, which resets the counts: kind 0
+ * gettimeofday, 1 clock_gettime; their number (at most max). */
+int runtime_clock_callers_take(int *kinds, uintptr_t *callers, uint32_t *counts, int max);
+/* The CPU timer (TSC) frequency the game was given, and the timer's rate measured since that
+ * calibration: 0 before the calibration or in its first second. */
+int runtime_tsc_check(uint64_t *given_hz, double *measured_hz, double *seconds);
+/* sceRtcGetCurrentNetworkTick and sceRtcGetCurrentTick calls since the previous take, and up to
+ * max distinct callers of the network tick with their counts: their number. */
+int runtime_rtc_clock_take(uint64_t *network_ticks, uint64_t *current_ticks, uintptr_t *callers,
+                           uint32_t *counts, int max);
+/* The game's image, for printing its code addresses as offsets (runtime_net.c). */
+void runtime_net_set_image(const unsigned char *image, size_t size);
+/* One of the image's executable segments: the only memory the send-chain scan reads code bytes from. */
+void runtime_net_add_code(const unsigned char *start, size_t size);
 int runtime_replay_start(unsigned char *image, size_t size); /* runtime_replay.c (spectator build) */
 /* 1 while a replay of a race without item crates (Time Trial, Itemless) loads or plays (runtime_replay_play.c) */
 int runtime_replay_no_crates(void);

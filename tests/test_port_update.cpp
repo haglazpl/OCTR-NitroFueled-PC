@@ -52,6 +52,20 @@ static void Versions() {
     CHECK(!IsNewer(ParseVersion("v0.5.2-3-gabc1234-windows"), ParseVersion("v0.5.2")));
     CHECK(IsNewer(ParseVersion("v0.5.3-prueba-windows"), ParseVersion("v0.5.3")));
     CHECK(!IsNewer(ParseVersion("unknown"), ParseVersion("v0.5.3")));
+    // The fork's releases: -net<N> after Ryu7w7's version, numbered among themselves.
+    CHECK(ParseVersion("v0.7.5-net2-windows").stage == 3 && ParseVersion("v0.7.5-net2-windows").build == 2);
+    CHECK(ParseVersion("v0.7.5-net2-4-gabc1234-windows").commits == 4);
+    CHECK(ParseVersion("v0.7.5-net0").stage == 0);
+    CHECK(ParseVersion("v0.7.5-netx").stage == 0);
+    CHECK(IsNewer(ParseVersion("v0.7.5-windows"), ParseVersion("v0.7.5-net1")));
+    CHECK(IsNewer(ParseVersion("v0.7.5-3-gabc1234-windows"), ParseVersion("v0.7.5-net1")));
+    CHECK(IsNewer(ParseVersion("v0.7.5-net1-windows"), ParseVersion("v0.7.5-net2")));
+    CHECK(IsNewer(ParseVersion("v0.7.5-net9-windows"), ParseVersion("v0.7.5-net10")));
+    CHECK(IsNewer(ParseVersion("v0.7.5-net2-windows"), ParseVersion("v0.7.6")));
+    CHECK(IsNewer(ParseVersion("v0.7.5-net2-3-gabc1234-windows"), ParseVersion("v0.7.5-net3")));
+    CHECK(!IsNewer(ParseVersion("v0.7.5-net2-windows"), ParseVersion("v0.7.5-net2")));
+    CHECK(!IsNewer(ParseVersion("v0.7.5-net2-windows"), ParseVersion("v0.7.5")));
+    CHECK(!IsNewer(ParseVersion("v0.7.5-net2-3-gabc1234-windows"), ParseVersion("v0.7.5-net2")));
 }
 
 static void Releases() {

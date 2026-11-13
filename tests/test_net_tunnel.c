@@ -80,6 +80,29 @@ static void one_way_path_keeps_the_tunnel(void) {
     }
 }
 
+/* B rejoins: its one tunnelled packet says "your direct packets do not reach me" (sent before they
+ * did), then B stops tunnelling because they do. A must stop copying too, not for the rest of the
+ * session (the 2026-11-02 logs: the host copied every packet to that player through the relay). */
+static void peer_stops_tunnelling(void) {
+    tun_reset();
+    const uint32_t b = ip4(91, 234, 125, 172);
+    uint8_t flags;
+    const uint64_t t = 1000;
+    CHECK(tun_on_send(b, 3074, t, &flags, &relay_slot) != 0);
+    tun_on_tunnelled(b, 3074, 0, 1, t + 10);
+    /* While B's word is recent, A believes it and keeps copying. */
+    for (uint64_t now = t + 20; now + 1 < t + 10 + TUN_PEER_QUIET_MS; now += 75) {
+        tun_on_direct(b, 3074, now);
+        CHECK(tun_on_send(b, 3074, now + 1, &flags, &relay_slot) != 0 && flags == 1);
+    }
+    /* B has been quiet in the tunnel that long and its direct packets keep coming: copies stop. */
+    tun_on_direct(b, 3074, t + 10 + TUN_PEER_QUIET_MS);
+    CHECK(tun_on_send(b, 3074, t + 11 + TUN_PEER_QUIET_MS, &flags, &relay_slot) == 0 && flags == 1);
+    CHECK(tun_on_send(b, 3074, t + 60000, &flags, &relay_slot) == 1 && flags == 0); /* direct stops: tunnel again */
+    tun_on_direct(b, 3074, t + 60010);
+    CHECK(tun_on_send(b, 3074, t + 60020, &flags, &relay_slot) == 0 && flags == 1);
+}
+
 static void peer_without_the_tunnel(void) {
     tun_reset();
     const uint32_t old = ip4(201, 1, 2, 3);
@@ -235,6 +258,7 @@ int main(void) {
     wrap_format();
     both_directions_work();
     one_way_path_keeps_the_tunnel();
+    peer_stops_tunnelling();
     peer_without_the_tunnel();
     keepalive();
     many_peers();

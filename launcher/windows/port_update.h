@@ -17,15 +17,22 @@
 
 namespace PortUpdate {
 
-inline constexpr const char* kRepo = "Ryu7w7/OCTR-NitroFueled-PC";
+// haglazpl's fork (Ryu7w7's port with P2P netcode changes; the RyuNET server is unchanged):
+// updates come from this fork's releases, tagged v<Ryu's version>-net<N> (see Version).
+inline constexpr const char* kRepo = "haglazpl/OCTR-NitroFueled-PC";
 inline constexpr const char* kPackageFolder = "CTR-NitroFueled-PC-portable";  // the ZIP's top folder
 
 /// A version as builds and tags name it: v<major>.<minor>[.<patch>][suffix]. A git-describe
 /// suffix (-<n>-g<hash>) comes after the tag it counts from; any other suffix (-prueba, -rc1)
-/// before it. "-windows" and "-dirty" are ignored.
+/// before it. "-windows" and "-dirty" are ignored. The fork's releases are -net<N> on top of
+/// Ryu7w7's version (v0.7.5-net1, v0.7.5-net2...): after that version's own release and builds,
+/// numbered among themselves, with git describe's -<n>-g<hash> after them for test builds.
 struct Version {
     int major = 0, minor = 0, patch = 0;
-    int stage = 1;  // 0 before the tag (test build), 1 the tag itself, 2 after it (git describe)
+    int stage = 1;  // 0 before the tag (test build), 1 the tag itself, 2 after it (git describe),
+                    // 3 a fork release (-net<N>)
+    int build = 0;    // the fork release's N
+    int commits = 0;  // commits after the fork release (-net<N>-<commits>-g<hash>)
     bool valid = false;
 };
 Version ParseVersion(const std::string& text);

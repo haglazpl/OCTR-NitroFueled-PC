@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The game's network update rate (USA 1.21, CUSA13795).
+     The game's thread "Network PostUpdate" runs once per frame. Its update (eboot 0xa478e0 + 0x400000)
+     adds the frame's time to a timer and, when the timer reaches 1.0 / the network settings' send rate
+     (15 a second), sends this PC's state to every player (0x436c30) and sets the timer to 0. At 60 FPS
+     that is 4 or 5 frames: 13.3 sends a second (the logs: 66-85 ms, 75 on average). Found with net9's
+     send chains (frame-pointer walks): every race send comes from that thread through 0xa47890.
+     The patch makes the instruction that loads the 1.0 (0xE4797B, vmovss xmm1,[rip+disp]) load a
+     smaller constant from the game's read-only data instead, so the threshold becomes that constant /
+     15. The send rate itself (and what the game derives from it: the 2/15 s interpolation delay) is
+     unchanged. ExpectedSHA256 checks the original instruction (C5 FA 10 0D E9 F4 25 01) first, so
+     another build skips it. net8's patches of 0x20A7AEC changed another, unrelated timer. -->
+<!-- Interpolation delay (same game, same check of the original instruction).
+     Each frame the game shows the other players as they were a fixed time ago (eboot 0x4333f0 + 0x400000, reached
+     through 0x3ee040): it takes the time now, in 1/8192 s, subtracts (2 / send rate) * 8192, and has
+     every replicated object apply its state at that moment (0x433550, the components' interpolation).
+     2 / 15 s = 133 ms: two of the game's original update intervals, so that the next update is always
+     there to slide towards. The patch makes the multiply by 8192.0 at 0x833471
+     (vmulss xmm0,xmm0,[rip+disp]) use the game's 4096.0 constant instead, so the delay is 67 ms: two
+     update intervals at 30 a second. Two experiments use 2048.0 (33 ms) and 0.0 (no delay: the game
+     predicts or holds); all three write the same instruction, so turn on only one. The send rate and the connection monitor that compares the RTT
+     with the delay (0x4340d0) keep the original 133 ms value. -->
+<!-- Potion fix (runtime, src/runtime_item_trace.c; same game).
+     A dropped potion's kart-touch check (eboot 0xf17570 + 0x400000) runs on every PC, for every kart that PC
+     shows: each PC decides from its own screen that someone else's kart drove into a potion, and the
+     potion's owner sends that decision to everyone. The runtime's hook on that check leaves the touch
+     of a human kart that another PC drives to that PC, when this patch is on. The patch itself changes
+     no code that runs: it rewrites the 5-byte jmp at 0xf17730 unchanged with its padding (ten 0x90, so
+     ExpectedSHA256 checks 16 bytes of this build) and puts 0xCC in the last padding byte, 0xf1773f,
+     which the runtime reads after the patches are applied. -->
+<!-- With Ryu's v0.8.6 (src/runtime_item_lead.c, net_config_tick) the game's send rate itself comes from
+     the RyuNET server (60 Hz when this was merged), for every player. Both patches above scale what the
+     game derives from that rate: the send threshold becomes 0.375 / rate (6 ms at 60 Hz: a send every
+     frame; 25 ms at the game's own 15 Hz), and the delay 2 / rate times the patch's factor (33 ms at
+     60 Hz without a patch, 17 ms, 8 ms or 0 with one). The log's "Net config" and "Net rate" lines say
+     what the game uses and sends. -->
+<Patch>
+    <TitleID>
+        <ID>CUSA13795</ID>
+    </TitleID>
+    <Metadata Title="Crash Team Racing Nitro-Fueled"
+              Name="Online: 30 network updates per second"
+              Note="Since v0.8.6 the server sets the game's update rate (60 a second) for everyone, so this is rarely needed: leave it off unless the log's 'Net rate' line shows about 30 datagrams a second instead of 60. What it does: the game sends when a timer passes 1 / rate and then resets the timer, so a frame that is a hair short of that waits one more frame. This sends when the timer passes 0.375 / rate: every frame at the server's 60, or 30 a second at the game's own 15 (offline server setting). It changes only what this PC sends."
+              Author="haglazpl (OCTR-NitroFueled-PC fork)"
+              PatchVer="2.0"
+              AppVer="01.21"
+              AppElf="eboot.bin">
+        <PatchList>
+            <!-- vmovss xmm1,[rip+disp]: loads 0.375 (at 0x2078AA0) instead of 1.0 -->
+            <Line Type="bytes" Address="0x00E4797B" Value="C5FA100D1D112301" ExpectedSHA256="60c41fb379734ef949af35e00303a7fd4b3b989f9a58a80101718163e44ba3b5"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Crash Team Racing Nitro-Fueled"
+              Name="Online: other karts shown half as far behind"
+              Note="The game shows the other players as they were two updates ago (on top of the ping), so that it always has the next update to slide them towards: 33 ms at the server's 60 updates a second (133 ms at the game's own 15). This halves it: 17 ms (67 ms). Only one of the three 'behind / no delay' patches may be on."
+              Author="haglazpl (OCTR-NitroFueled-PC fork)"
+              PatchVer="1.0"
+              AppVer="01.21"
+              AppElf="eboot.bin">
+        <PatchList>
+            <!-- vmulss xmm0,xmm0,[rip+disp]: multiplies by 4096.0 (at 0x20483F8) instead of 8192.0 -->
+            <Line Type="bytes" Address="0x00833471" Value="C5FA59057F4F8101" ExpectedSHA256="db86b98b45f2ec69cc899f32f86b0bc836ae2be7748dc8f90899297fdf554eba"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Crash Team Racing Nitro-Fueled"
+              Name="Online (experiment): other karts shown a quarter as far behind"
+              Note="Instead of the 'half' patch (turn that one off). Shows the other players half an update in the past instead of two: 8 ms at the server's 60 updates a second (33 ms at the game's own 15). A late update can make them stutter or be guessed forward."
+              Author="haglazpl (OCTR-NitroFueled-PC fork)"
+              PatchVer="1.0"
+              AppVer="01.21"
+              AppElf="eboot.bin">
+        <PatchList>
+            <!-- vmulss xmm0,xmm0,[rip+disp]: multiplies by 2048.0 (at 0x2002AF0) instead of 8192.0 -->
+            <Line Type="bytes" Address="0x00833471" Value="C5FA590577F67C01" ExpectedSHA256="db86b98b45f2ec69cc899f32f86b0bc836ae2be7748dc8f90899297fdf554eba"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Crash Team Racing Nitro-Fueled"
+              Name="Online (experiment): other karts shown with no delay"
+              Note="Instead of the 'half' patch (turn that one off). The game shows the other players at the current moment, guessing their position from their last update (its own prediction). Closest to where they really are; it played well in our tests at 30 updates a second, and since v0.8.6 the server gives everyone 60. It only changes how this PC shows the others."
+              Author="haglazpl (OCTR-NitroFueled-PC fork)"
+              PatchVer="1.0"
+              AppVer="01.21"
+              AppElf="eboot.bin">
+        <PatchList>
+            <!-- vmulss xmm0,xmm0,[rip+disp]: multiplies by 0.0 (at 0x1FF1448, inside the game's read-only data) instead of 8192.0 -->
+            <Line Type="bytes" Address="0x00833471" Value="C5FA5905CFDF7B01" ExpectedSHA256="db86b98b45f2ec69cc899f32f86b0bc836ae2be7748dc8f90899297fdf554eba"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Crash Team Racing Nitro-Fueled"
+              Name="Online: each PC decides potion hits only for its own kart"
+              Note="The game lets every PC decide, from where the karts are on its own screen, that another player's kart drove into a potion; the other players then see the potion hit (or vanish) although on their screen the kart was not in it. With this on, this PC decides potion hits only for the kart you drive (and, for the host, the AI karts); a potion another player drives into is decided by that player's PC. It changes only what this PC decides, so it works in a room where others don't use it; it is complete when everyone uses it. Needs build net14 or later."
+              Author="haglazpl (OCTR-NitroFueled-PC fork)"
+              PatchVer="1.0"
+              AppVer="01.21"
+              AppElf="eboot.bin">
+        <PatchList>
+            <!-- jmp 0xf177d0 and ten 0x90 as they are, then 0xCC for 0x90 at 0x131773F: the runtime's switch -->
+            <Line Type="bytes" Address="0x01317730" Value="E99B00000090909090909090909090CC" ExpectedSHA256="6650f9f52e9e46803bded577c0f2463b79995ab7e2ce4a4a575dbeafac706f8e"/>
+        </PatchList>
+    </Metadata>
+</Patch>

@@ -298,7 +298,23 @@ static ABI int32_t net_bind(int s,const void *addr,uint32_t addrlen) { return ru
 static ABI int32_t net_listen(int s,int backlog) { return runtime_net_listen(s,backlog); }
 static ABI int32_t net_accept(int s,void *addr,uint32_t *addrlen) { return runtime_net_accept(s,(OrbisNetSockaddr*)addr,addrlen); }
 static ABI int32_t net_send(int s,const void *msg,size_t len,int flags) { return runtime_net_send(s,msg,len,flags); }
-static ABI int32_t net_sendto(int s,const void *msg,size_t len,int flags,const void *to,uint32_t tolen) { return runtime_net_sendto(s,msg,len,flags,(const OrbisNetSockaddr*)to,tolen); }
+/* sceNetSendto with the game's return address and its rbp as they were at the call (7th and 8th
+ * arguments, on the stack): the network summary walks the game's frame pointers from there. The
+ * port's own C code may keep rbp anywhere in its frames (64-bit Windows), so the entry stub reads
+ * it before any of them. Stack at the stub: return address; it keeps the 16-byte alignment. */
+static __attribute__((used)) ABI int32_t net_sendto_traced(int s,const void *msg,size_t len,int flags,const void *to,
+                                                           uint32_t tolen,const void *caller,uintptr_t guest_rbp) {
+    return runtime_net_sendto_from(s,msg,len,flags,(const OrbisNetSockaddr*)to,tolen,caller,guest_rbp);
+}
+__attribute__((naked)) static void net_sendto(void) {
+    __asm__ volatile(
+        "sub $8, %rsp\n\t"
+        "push %rbp\n\t"          /* 8th: the game's rbp */
+        "pushq 16(%rsp)\n\t"     /* 7th: the game's return address */
+        "call net_sendto_traced\n\t"
+        "add $24, %rsp\n\t"
+        "ret\n\t");
+}
 static ABI int32_t net_recv(int s,void *buf,size_t len,int flags) { return runtime_net_recv(s,buf,len,flags); }
 static ABI int32_t net_recvfrom(int s,void *buf,size_t len,int flags,void *from,uint32_t *fromlen) { return runtime_net_recvfrom(s,buf,len,flags,(OrbisNetSockaddr*)from,fromlen); }
 static ABI int32_t net_setsockopt(int s,int level,int optname,const void *optval,uint32_t optlen) { return runtime_net_setsockopt(s,level,optname,optval,optlen); }

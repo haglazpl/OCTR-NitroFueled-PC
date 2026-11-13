@@ -28,16 +28,29 @@ def release_json(tag="v0.5.5", data=b"new appimage", digest=True):
 
 class AppImageUpdateTests(unittest.TestCase):
     def test_versions_follow_the_windows_rules(self):
-        self.assertEqual(au.parse_version("v0.5.4"), (0, 5, 4, 1))
-        self.assertEqual(au.parse_version("v0.5.4-linux"), (0, 5, 4, 1))
-        self.assertEqual(au.parse_version("v0.5.4-3-gabc123-dirty"), (0, 5, 4, 2))
-        self.assertEqual(au.parse_version("v0.5.5-rc1"), (0, 5, 5, 0))
+        self.assertEqual(au.parse_version("v0.5.4"), (0, 5, 4, 1, 0, 0))
+        self.assertEqual(au.parse_version("v0.5.4-linux"), (0, 5, 4, 1, 0, 0))
+        self.assertEqual(au.parse_version("v0.5.4-3-gabc123-dirty"), (0, 5, 4, 2, 0, 0))
+        self.assertEqual(au.parse_version("v0.5.5-rc1"), (0, 5, 5, 0, 0, 0))
         self.assertIsNone(au.parse_version("abc123"))
         self.assertTrue(au.is_newer(au.parse_version("v0.5.4-linux"), au.parse_version("v0.5.5")))
         self.assertTrue(au.is_newer(au.parse_version("v0.5.5-rc1"), au.parse_version("v0.5.5")))
         self.assertFalse(au.is_newer(au.parse_version("v0.5.5-2-gdeadbeef"), au.parse_version("v0.5.5")))
         self.assertFalse(au.is_newer(au.parse_version("v0.5.5"), au.parse_version("v0.5.5")))
         self.assertFalse(au.is_newer(None, au.parse_version("v0.5.5")))
+        # The fork's releases: -net<N> after Ryu7w7's version, numbered among themselves.
+        self.assertEqual(au.parse_version("v0.7.5-net2-linux"), (0, 7, 5, 3, 2, 0))
+        self.assertEqual(au.parse_version("v0.7.5-net2-4-gabc123"), (0, 7, 5, 3, 2, 4))
+        self.assertEqual(au.parse_version("v0.7.5-net0"), (0, 7, 5, 0, 0, 0))
+        self.assertTrue(au.is_newer(au.parse_version("v0.7.5"), au.parse_version("v0.7.5-net1")))
+        self.assertTrue(au.is_newer(au.parse_version("v0.7.5-3-gabc123"), au.parse_version("v0.7.5-net1")))
+        self.assertTrue(au.is_newer(au.parse_version("v0.7.5-net1"), au.parse_version("v0.7.5-net2")))
+        self.assertTrue(au.is_newer(au.parse_version("v0.7.5-net9"), au.parse_version("v0.7.5-net10")))
+        self.assertTrue(au.is_newer(au.parse_version("v0.7.5-net2"), au.parse_version("v0.7.6")))
+        self.assertTrue(au.is_newer(au.parse_version("v0.7.5-net2-3-gabc123"), au.parse_version("v0.7.5-net3")))
+        self.assertFalse(au.is_newer(au.parse_version("v0.7.5-net2"), au.parse_version("v0.7.5-net2")))
+        self.assertFalse(au.is_newer(au.parse_version("v0.7.5-net2"), au.parse_version("v0.7.5")))
+        self.assertFalse(au.is_newer(au.parse_version("v0.7.5-net2-3-gabc123"), au.parse_version("v0.7.5-net2")))
 
     def test_release_picks_the_appimage(self):
         r = au.parse_release(release_json())
