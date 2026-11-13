@@ -17,8 +17,17 @@
      2 / 15 s = 133 ms: two of the game's original update intervals, so that the next update is always
      there to slide towards. The patch makes the multiply by 8192.0 at 0x833471
      (vmulss xmm0,xmm0,[rip+disp]) use the game's 4096.0 constant instead, so the delay is 67 ms: two
-     update intervals at 30 a second. The send rate and the connection monitor that compares the RTT
+     update intervals at 30 a second. Two experiments use 2048.0 (33 ms) and 0.0 (no delay: the game
+     predicts or holds); all three write the same instruction, so turn on only one. The send rate and the connection monitor that compares the RTT
      with the delay (0x4340d0) keep the original 133 ms value. -->
+<!-- Potion fix (runtime, src/runtime_item_trace.c; same game).
+     A dropped potion's kart-touch check (eboot 0xf17570 + 0x400000) runs on every PC, for every kart that PC
+     shows: each PC decides from its own screen that someone else's kart drove into a potion, and the
+     potion's owner sends that decision to everyone. The runtime's hook on that check leaves the touch
+     of a human kart that another PC drives to that PC, when this patch is on. The patch itself changes
+     no code that runs: it rewrites the 5-byte jmp at 0xf17730 unchanged with its padding (ten 0x90, so
+     ExpectedSHA256 checks 16 bytes of this build) and puts 0xCC in the last padding byte, 0xf1773f,
+     which the runtime reads after the patches are applied. -->
 <Patch>
     <TitleID>
         <ID>CUSA13795</ID>
@@ -45,6 +54,42 @@
         <PatchList>
             <!-- vmulss xmm0,xmm0,[rip+disp]: multiplies by 4096.0 (at 0x20483F8) instead of 8192.0 -->
             <Line Type="bytes" Address="0x00833471" Value="C5FA59057F4F8101" ExpectedSHA256="db86b98b45f2ec69cc899f32f86b0bc836ae2be7748dc8f90899297fdf554eba"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Crash Team Racing Nitro-Fueled"
+              Name="Online (experiment): other karts shown 33 ms behind"
+              Note="Test only, instead of the 67 ms patch (turn that one off). Shows the other players one update (33 ms at 30 a second) in the past instead of two: they are closer to where they really are, but a late update can make them stutter or be guessed forward. Needs the 30 network updates patch for everyone."
+              Author="haglazpl (OCTR-NitroFueled-PC fork)"
+              PatchVer="1.0"
+              AppVer="01.21"
+              AppElf="eboot.bin">
+        <PatchList>
+            <!-- vmulss xmm0,xmm0,[rip+disp]: multiplies by 2048.0 (at 0x2002AF0) instead of 8192.0 -->
+            <Line Type="bytes" Address="0x00833471" Value="C5FA590577F67C01" ExpectedSHA256="db86b98b45f2ec69cc899f32f86b0bc836ae2be7748dc8f90899297fdf554eba"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Crash Team Racing Nitro-Fueled"
+              Name="Online (experiment): other karts shown with no delay"
+              Note="Test only, instead of the 67 ms patch (turn that one off). The game shows the other players at the current moment, so it has to guess their position from their last update (its own prediction), or holds them at their last update if it does not guess. Closest to where they really are, but expect jerky or jumping karts. Needs the 30 network updates patch for everyone."
+              Author="haglazpl (OCTR-NitroFueled-PC fork)"
+              PatchVer="1.0"
+              AppVer="01.21"
+              AppElf="eboot.bin">
+        <PatchList>
+            <!-- vmulss xmm0,xmm0,[rip+disp]: multiplies by 0.0 (at 0x1FF1448, inside the game's read-only data) instead of 8192.0 -->
+            <Line Type="bytes" Address="0x00833471" Value="C5FA5905CFDF7B01" ExpectedSHA256="db86b98b45f2ec69cc899f32f86b0bc836ae2be7748dc8f90899297fdf554eba"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Crash Team Racing Nitro-Fueled"
+              Name="Online: each PC decides potion hits only for its own kart"
+              Note="The game lets every PC decide, from where the karts are on its own screen, that another player's kart drove into a potion; the other players then see the potion hit (or vanish) although on their screen the kart was not in it. With this on, this PC decides potion hits only for the kart you drive (and, for the host, the AI karts); a potion another player drives into is decided by that player's PC. It changes only what this PC decides, so it works in a room where others don't use it; it is complete when everyone uses it. Needs build net14 or later."
+              Author="haglazpl (OCTR-NitroFueled-PC fork)"
+              PatchVer="1.0"
+              AppVer="01.21"
+              AppElf="eboot.bin">
+        <PatchList>
+            <!-- jmp 0xf177d0 and ten 0x90 as they are, then 0xCC for 0x90 at 0x131773F: the runtime's switch -->
+            <Line Type="bytes" Address="0x01317730" Value="E99B00000090909090909090909090CC" ExpectedSHA256="6650f9f52e9e46803bded577c0f2463b79995ab7e2ce4a4a575dbeafac706f8e"/>
         </PatchList>
     </Metadata>
 </Patch>
