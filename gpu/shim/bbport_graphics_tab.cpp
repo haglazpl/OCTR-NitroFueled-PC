@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+#include <thread>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -32,6 +33,7 @@
 #endif
 
 extern "C" void runtime_restart(void); // bb-probe (probe.c): run.py starts the game again
+extern "C" const char* runtime_text(const char* english); // the game's language (src/runtime_text.c)
 // runtime_file.c: the relabelled menus (update3.pak, scripts/graphics_tab.py) reach the game
 // only when every hook below is in: a tab or a Quit Game button without its hook would open a
 // menu or a map that does not exist.
@@ -302,7 +304,7 @@ void SetText(u64 placeable, const char* text) {
     if (!placeable) {
         return;
     }
-    SetStringField(placeable + 0x30, text);
+    SetStringField(placeable + 0x30, runtime_text(text)); // the port's texts in the game's language
     *reinterpret_cast<u32*>(placeable + 0xc) |= 0x1000;
 }
 
@@ -359,8 +361,17 @@ bool IsA(void* event, u64 meta_global) {
 }
 
 std::mutex rows_mutex;
+std::atomic<bool> refresh_requested{false};
+std::thread::id guest_ui_thread;
 std::vector<u64> list_items; // native igGuiListItem objects, same lifetime as rows
 std::vector<u64> rows; ///< the language items, in the order the list filled them
+
+void ClearRows() {
+    std::scoped_lock lock{rows_mutex};
+    rows.clear();
+    list_items.clear();
+    guest_ui_thread = {};
+}
 
 const char* OnOff(bool on) {
     return on ? "On" : "Off";
@@ -381,9 +392,26 @@ std::string Row(std::size_t row, int change) {
     case 0: {
         // The render size (render_res); the shape is the Aspect Ratio row's.
         int k = v.render_res.load() < 0 ? 2 : v.render_res.load();
+        const int scene_height = v.native_scene_height;
+        const bool actual = v.LiveGraphics() && scene_height > 0 &&
+            (!v.native_resolution_requested || (v.temporal == BbSettings::TemporalDlss && v.dlss_quality > 0));
+        if (actual) {
+            if (!change) {
+                std::snprintf(text, sizeof(text), "%dp", scene_height);
+                return text;
+            }
+            k = change > 0 ? 0 : BbSettings::RenderResCount - 1;
+            if (change > 0) {
+                while (k < BbSettings::RenderResCount && BbSettings::RenderResHeights[k] <= scene_height) ++k;
+                if (k == BbSettings::RenderResCount) k = 0;
+            } else {
+                while (k >= 0 && BbSettings::RenderResHeights[k] >= scene_height) --k;
+                if (k < 0) k = BbSettings::RenderResCount - 1;
+            }
+        }
         if (change) {
-            k = (k + change + BbSettings::RenderResCount) % BbSettings::RenderResCount;
-            v.render_res = k;
+            if (!actual) k = (k + change + BbSettings::RenderResCount) % BbSettings::RenderResCount;
+            v.SetRenderResolution(k);
         }
         std::snprintf(text, sizeof(text), "%dp", BbSettings::RenderResHeights[k]);
         return text;
@@ -423,13 +451,14 @@ std::string Row(std::size_t row, int change) {
         return text;
     }
     case 5: {
-        static const int limits[] = {30, 60, 120, 144, 240, 0};
+        const auto& limits = BbSettings::FpsLimits;
+        constexpr int count = int(std::size(BbSettings::FpsLimits));
         int limit = v.fps_limit.load(), k = 0;
-        while (k < 6 && limits[k] != limit) {
+        while (k < count && limits[k] != limit) {
             ++k;
         }
         if (change) {
-            limit = limits[(k + change + 6) % 6];
+            limit = limits[(k + change + count) % count];
             v.fps_limit = limit;
         }
         if (limit) {
@@ -444,21 +473,7 @@ std::string Row(std::size_t row, int change) {
         int ratio = std::clamp(v.aspect_ratio.load(), 0, BbSettings::AspectRatioCount - 1);
         if (change) {
             ratio = (ratio + change + BbSettings::AspectRatioCount) % BbSettings::AspectRatioCount;
-            v.aspect_ratio = ratio;
-            if (ratio != BbSettings::Aspect16x9) {
-                v.ultrawide = 0;
-                const int w = v.aspect_w.load(), h = v.aspect_h.load();
-                const bool tall = (w == 1920 && h == 1200) || (w == 1280 && h == 800) ||
-                                  (w == 2560 && h == 1600);
-                const bool wide = (w == 3440 && h == 1440) || (w == 2560 && h == 1080);
-                const bool super = (w == 5120 && h == 1440) || (w == 3840 && h == 1080) ||
-                                   (w == 2560 && h == 720) || (w == 7680 && h == 2160);
-                if (!((ratio == BbSettings::Aspect16x10 && tall) ||
-                      (ratio == BbSettings::Aspect21x9 && wide) || (ratio == BbSettings::Aspect32x9 && super))) {
-                    v.aspect_w = ratio == BbSettings::Aspect16x10 ? 1920 : ratio == BbSettings::Aspect21x9 ? 3440 : 5120;
-                    v.aspect_h = ratio == BbSettings::Aspect16x10 ? 1200 : 1440;
-                }
-            }
+            v.SetAspectRatio(ratio);
         }
         std::snprintf(text, sizeof(text), "%s", BbSettings::AspectRatioNames[ratio]);
         return text;
@@ -474,14 +489,22 @@ constexpr const char* Titles[] = {
 };
 
 std::string Description(std::size_t index) {
+    const auto& settings = BbSettings::Get();
+    if (settings.LiveGraphics()) {
+        if (index == 0)
+            return "Choose the internal rendering resolution. Applies live to the 3D scene.";
+        if (index == 3) return "Choose DLSS image quality. Applies live at the current output size.";
+        if (index == 4) return "Unlock the frame rate immediately; Off limits the game to 30 FPS.";
+        if (index == 5) return "Enable or disable motion blur immediately.";
+    }
     static constexpr const char* help[] = {
         "Choose the internal rendering resolution. Restart to apply.",
         "Choose a 16:9, 16:10, 21:9, or 32:9 layout. Restart to apply.",
-        "Choose the image upscaler. Restart to apply.",
-        "Choose DLSS image quality. Restart to apply.",
+        "Choose the image upscaler. Applies immediately at the current render size.",
+        "Choose DLSS image quality. A different internal render size requires a restart.",
         "Unlock the game's frame rate. Restart to apply.",
         "Enable or disable motion blur. Restart to apply.",
-        "Limit the number of frames rendered per second.",
+        "Limit the number of frames rendered per second. Applies immediately.",
         "Restart the game to apply your saved graphics settings.",
     };
 
@@ -665,14 +688,8 @@ void UpdateDescription(u64 item, std::size_t index) {
 /// Settings on the page that apply only after a restart (as the settings menu counts them).
 bool NeedsRestart() {
     auto& v = BbSettings::Get();
-    bool restart = BbSettings::ResolutionNeedsRestart() || BbSettings::RenderSizeNeedsRestart();
-    for (int g = 0; g < BbSettings::GamePatchCount; ++g) {
-        restart |= v.game_patches[g] != v.startup_game_patches[g];
-    }
-    restart |= v.render_res != v.startup_render_res || v.temporal != v.startup_temporal ||
-               v.dlss_quality != v.startup_dlss_quality || v.aspect_ratio != v.startup_aspect_ratio ||
-               v.output_res != v.startup_output_res;
-    return restart;
+    return BbSettings::ResolutionNeedsRestart() || BbSettings::RenderSizeNeedsRestart() ||
+           v.GraphicsRestartRequired();
 }
 
 constexpr std::size_t SettingRows = 7;  ///< rows 0..6: the settings
@@ -732,7 +749,23 @@ void UpdateRestartRow() {
     }
 }
 
+void RefreshRows() {
+    std::vector<u64> all;
+    {
+        std::scoped_lock lock{rows_mutex};
+        all = rows;
+    }
+    for (std::size_t r = 0; r < all.size() && r < SettingRows; ++r) {
+        if (!all[r]) continue;
+        const std::string text = Row(r, false);
+        SetText(*reinterpret_cast<u64*>(all[r] + 0x10), text.c_str());
+        UpdateWidgets(all[r], r);
+    }
+    UpdateRestartRow();
+}
+
 u64 PS4_SYSV_ABI LanguageItemHook(void* self, void* event, void* a2, void* a3, void* a4, void* a5) {
+    if (refresh_requested.exchange(false)) RefreshRows();
     const u64 item = reinterpret_cast<u64>(self);
     if (event && IsA(event, InputEventMeta)) {
         const u32 type = *reinterpret_cast<u32*>(static_cast<u8*>(event) + 0x18);
@@ -753,6 +786,7 @@ u64 PS4_SYSV_ABI LanguageItemHook(void* self, void* event, void* a2, void* a3, v
             return 0;
         }
         if (type == 9) {
+            ClearRows();
             return language_item_original(self, event, a2, a3, a4, a5);
         }
         if (index != SIZE_MAX && index >= SettingRows) {
@@ -762,16 +796,7 @@ u64 PS4_SYSV_ABI LanguageItemHook(void* self, void* event, void* a2, void* a3, v
                               (type == 3 || type == 7) ? 1 : 0;
         if (index != SIZE_MAX && direction) {
             const std::string text = Row(index, direction);
-            std::vector<u64> all;
-            {
-                std::scoped_lock lock{rows_mutex};
-                all = rows;
-            }
-            for (std::size_t r = 0; r < all.size() && r < SettingRows; ++r) {
-                const std::string t = r == index ? text : Row(r, false);
-                SetText(*reinterpret_cast<u64*>(all[r] + 0x10), t.c_str());
-                UpdateWidgets(all[r], r);
-            }
+            RefreshRows();
             BbSettings::Save();
             UpdateRestartRow();
             UpdateDescription(item, index);
@@ -790,6 +815,7 @@ u64 PS4_SYSV_ABI LanguageItemHook(void* self, void* event, void* a2, void* a3, v
     }
     const u64 result = language_item_original(self, event, a2, a3, a4, a5);
     if (event && IsA(event, GainFocusMeta)) {
+        RefreshRows();
         std::size_t index;
         {
             std::scoped_lock lock{rows_mutex};
@@ -801,6 +827,7 @@ u64 PS4_SYSV_ABI LanguageItemHook(void* self, void* event, void* a2, void* a3, v
         std::size_t index;
         {
             std::scoped_lock lock{rows_mutex};
+            guest_ui_thread = std::this_thread::get_id();
             index = std::find(rows.begin(), rows.end(), item) - rows.begin();
             if (index == rows.size()) {
                 rows.push_back(item);
@@ -833,6 +860,7 @@ VscFn load_map_original = nullptr;
 using StringPinFn = void PS4_SYSV_ABI (*)(char**, void*, void*, const void*);
 
 u64 PS4_SYSV_ABI LoadMapHook(void* context, void* args, void* a2, void* a3, void* a4, void* a5) {
+    ClearRows();
     void** pins = nullptr;
     void* pin = nullptr;
     char* map = nullptr;
@@ -899,12 +927,8 @@ u64 PS4_SYSV_ABI Open2Hook(void* context, void* args, void* a2, void* a3, void* 
         std::scoped_lock lock{last_mutex};
         last_opened = name;
     }
-    if (ours) {
-        // The Graphics page: the language screen opens; its rows are filled again.
-        std::scoped_lock lock{rows_mutex};
-        rows.clear();
-        list_items.clear();
-    }
+    // A transition retires the previous page's guest objects before opening the next page.
+    ClearRows();
     return open2_original(context, args, a2, a3, a4, a5);
 }
 
@@ -936,6 +960,17 @@ VscFn Detour(u8* stub, u64 offset, const u8* prologue, std::size_t size, const v
     return reinterpret_cast<VscFn>(stub);
 }
 } // namespace
+
+void RequestRefresh() { refresh_requested = true; }
+
+void PollRefresh() {
+    if (!refresh_requested.load(std::memory_order_relaxed)) return;
+    {
+        std::scoped_lock lock{rows_mutex};
+        if (guest_ui_thread != std::this_thread::get_id()) return;
+    }
+    if (refresh_requested.exchange(false)) RefreshRows();
+}
 
 void PatchImage(unsigned char* base, std::uint64_t size) {
     if (!BbSettings::Get().graphics_tab) {

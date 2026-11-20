@@ -29,6 +29,16 @@ FONTS = ('fonts/GeekSpeak.igz', 'fonts/GeekSpeak_Outline.igz', 'fonts/Zoinks_Out
 # The archives with those fonts (the update's copies are the ones the 1.21 game reads; the
 # others are patched too, so no screen shows a PlayStation button).
 ARCHIVES = ('update.pak', 'languagestartup.pak', 'permanent.pak')
+# Options > Controls (issue #256): opening the page, its script asks the controller type
+# (CInputNodes::checkControllerType2, one output per type) and each output keeps that platform's
+# animation tag for the page to play: the controller diagram and the labels on its lines. The
+# page's own pose is the PS4 one, which is what shows when no type matches. The game has the Xbox
+# One diagram too (ui_octane_controller_scheme_xb1): with Xbox prompts the node before the check
+# goes straight to the XB1 output, so the Xbox diagram plays whatever the controller. Every copy of
+# the script is patched: the updates' and the original domain archive's.
+CONTROLS_SCRIPT = 'vsc/UI/Octane_Options_Menu_Page/Octane_Options_Menu_Page_Root.igz'
+CONTROLS_TAGS = ('AnimationTag_PS4_ControlScheme', 'AnimationTag_XB1_ControlScheme')
+CONTROLS_ARCHIVES = ('update2.pak', 'update.pak', 'juicedomain_permanent.pak')
 ART = Path(__file__).resolve().parent / 'button_prompts'
 IMG_W, IMG_DATA = 24, 56  # igImage2: u16 width, u16 height; u64 size, u64 data pointer
 CM_CHAR, CM_UV = 12, 52   # igCharMetrics: u16 character; float u0, v0, u1, v1
@@ -39,6 +49,13 @@ CODES = {0xE000: 'Cross', 0xE001: 'Circle', 0xE002: 'Triangle', 0xE003: 'Square'
          0x298: 'Cross', 0x5E: 'Circle', 0x60: 'Triangle', 0x7E: 'Square', 0x5B: 'L1', 0x5D: 'R1',
          0x3C: 'L2', 0x3E: 'R2'}
 MIN_CELL = 50  # a button cell is bigger than this both ways (the font's letters are much smaller)
+# The voice chat's loudspeaker (scripts/assets/voice_glyph.png, tools/make_voice_glyph.py), a
+# character of its own: the nickname over a talking racer's kart ends with it
+# (src/runtime_replay_play.c), so the game draws it with the name. In the 1.21 fonts' button image
+# it takes an unused badge's cell (x0, y0, x1, y1; end exclusive).
+SPEAKER_CODE = 0xE013
+SPEAKER_CELL = (180, 170, 263, 259)
+SPEAKER_ART = Path(__file__).resolve().parent / 'assets' / 'voice_glyph.png'
 # Where each button is in our art (button_prompts/<style>.png): the 1.21 font's cells
 # (x0, y0, x1, y1; end exclusive). The sticks (L, R) are left as they are.
 SHEET = {
@@ -260,6 +277,129 @@ def restyled_font(blob, art):
     return blob[:at] + tile(linear, width, height, original) + blob[at + length:]
 
 
+def _alternate_list(blob):
+    """(file offset of its pointer array, [(slot file offset, metrics file offset, character)]) of
+    the font's alternate character metrics (the ones drawn from the button image)."""
+    objects, _strings_list, file_offset = _objects(blob)
+    for at, kind in objects:
+        if kind != 'igCharMetricsList':
+            continue
+        count, = struct.unpack_from('<I', blob, at + 12)
+        data, = struct.unpack_from('<Q', blob, at + 32)
+        array = file_offset(data)
+        slots = []
+        for i in range(count):
+            encoded, = struct.unpack_from('<Q', blob, array + i * 8)
+            metrics = file_offset(encoded)
+            slots.append((array + i * 8, metrics, struct.unpack_from('<H', blob, metrics + CM_CHAR)[0]))
+        if any(char in CODES and char >= 0xE000 for _, _, char in slots):
+            return array, slots
+    return None, []
+
+
+def with_speaker(blob, glyph):
+    """The font with the voice chat's loudspeaker (glyph: width, height, RGBA) as character
+    SPEAKER_CODE, or None when the font has no room for it. It takes SPEAKER_CELL of the button
+    image, which the font's metrics give a character 0 (one no text can ask for): that metrics
+    gets the loudspeaker's code and moves to the end of the alternate list, which stays sorted."""
+    width, height, at, length = image_location(blob)
+    array, slots = _alternate_list(blob)
+    if array is None or any(char == SPEAKER_CODE for _, _, char in slots):
+        return None
+    chosen = None
+    for i, (_slot, metrics, char) in enumerate(slots):
+        u0, v0, u1, v1 = struct.unpack_from('<4f', blob, metrics + CM_UV)
+        cell = (round(u0 * width), round(v0 * height), round(u1 * width) + 1, round(v1 * height) + 1)
+        if char == 0 and cell == SPEAKER_CELL:
+            chosen = i
+    codes = [char for _, _, char in slots]
+    if chosen is None or max(codes) >= SPEAKER_CODE:
+        return None
+    glyph_width, glyph_height, glyph_rgba = glyph
+    x0, y0, x1, y1 = SPEAKER_CELL
+    if (glyph_width, glyph_height) != (x1 - x0, y1 - y0):
+        raise ValueError(f'the loudspeaker is {glyph_width}x{glyph_height}, its cell {x1 - x0}x{y1 - y0}')
+    out = bytearray(blob)
+    stored = swap_red_blue(glyph_rgba)
+    original = blob[at:at + length]
+    linear = bytearray(untile(original, width, height))
+    for row in range(y1 - y0):
+        dst = ((y0 + row) * width + x0) * 4
+        linear[dst:dst + glyph_width * 4] = stored[row * glyph_width * 4:(row + 1) * glyph_width * 4]
+    out[at:at + length] = tile(linear, width, height, original)
+    struct.pack_into('<H', out, slots[chosen][1] + CM_CHAR, SPEAKER_CODE)
+    # the pointers in the array, the chosen one last (each slot stays a pointer: fixups unchanged)
+    pointers = [blob[slot:slot + 8] for slot, _, _ in slots]
+    pointers.append(pointers.pop(chosen))
+    out[array:array + 8 * len(pointers)] = b''.join(pointers)
+    return bytes(out)
+
+
+def _controls_check(igz):
+    """(the controller type check node, its XB1 output's reference, the nodes leading to the
+    check) in the Options page's script; None when it is not the script expected.
+
+    igVscCppActionNode: +0x28 the next node, +0x30 an igVscActionNodeList of the outputs (u32
+    count at +0x10, references at +0x20). Each output is an igVscAssignNode whose source (+0x10,
+    an igVscObjectFieldAccessor) reads an igHandleMetaField (+0x10) whose default (+0x38) is a
+    handle: an index into the external names (EXNM) that are not meta types."""
+    from igz_file import unpack_offsets
+    kind = dict(igz.objects())
+    rofs = set(igz.sites['ROFS'])
+    try:
+        f = igz.fixup('RHND')
+        exnm = igz.fixup('EXNM')
+    except KeyError:
+        return None
+    rhnd = set(unpack_offsets(f[3], f[1]))
+    pairs = [struct.unpack_from('<II', exnm[3], 8 * k) for k in range(exnm[1])]
+    meta = ('metaobject', 'metafunction', 'metafield')
+    handles = [igz.strings[a & 0x7FFFFFFF] for a, b in pairs if igz.strings[b & 0x7FFFFFFF] not in meta]
+
+    def ref(at, want=None):
+        target = igz.u64(at) & 0x7FFFFFF if at in rofs else None
+        return target if want is None or kind.get(target) == want else None
+
+    def assigned_tag(node):
+        source = ref(node + 0x10, 'igVscObjectFieldAccessor')
+        field = source is not None and ref(source + 0x10, 'igHandleMetaField')
+        default = field and ref(field + 0x38)
+        if default is None or default not in rhnd:
+            return None
+        index = igz.u64(default) & 0x7FFFFFFF
+        return handles[index] if index < len(handles) else None
+    found = []
+    for node, t in igz.objects():
+        outputs = ref(node + 0x30, 'igVscActionNodeList') if t == 'igVscCppActionNode' else None
+        if outputs is None or igz.u32(outputs + 0x10) < 2 or ref(outputs + 0x20) is None:
+            continue
+        refs = ref(outputs + 0x20) + 8
+        first, second = (ref(refs - 8 + 8 * k, 'igVscAssignNode') for k in (0, 1))
+        if first and second and (assigned_tag(first), assigned_tag(second)) == CONTROLS_TAGS:
+            before = [p for p, pt in igz.objects() if pt == 'igVscCppActionNode' and ref(p + 0x28) == node]
+            found.append((node, refs, before))
+    return found[0] if len(found) == 1 and found[0][2] else None
+
+
+def xbox_controls(blob):
+    """The Options page's script going from the node before the controller type check straight to
+    its XB1 output; None when the script is not the one expected."""
+    from igz_file import Igz
+    try:
+        igz = Igz(blob)
+        check = _controls_check(igz)
+    except (ValueError, KeyError, IndexError, struct.error):
+        return None
+    if check is None:
+        return None
+    _node, xb1_ref, before = check
+    data = igz.sections[1][1]
+    out = bytearray(blob)
+    for node in before:
+        out[data + node + 0x28:data + node + 0x30] = blob[data + xb1_ref:data + xb1_ref + 8]
+    return bytes(out)
+
+
 def chosen_style(config, env):
     """BB_BUTTON_PROMPTS, else bbport.ini button_prompts; playstation when neither or unknown."""
     value = env.get('BB_BUTTON_PROMPTS', '')
@@ -273,46 +413,73 @@ def chosen_style(config, env):
 
 
 def prepare(game, out, config, env, base):
-    """{guest archive: patch file} of the chosen style's fonts (none for the PlayStation buttons),
-    each keeping the patch base ({guest: patch file}) has for the same archive. Kept between
-    launches while the archives, the art and the base patches are the same."""
-    style = chosen_style(config, env)
-    if style == 'playstation':
-        return {}
+    """{guest archive: patch file} of the fonts: the chosen style's buttons (the game's own for
+    the PlayStation ones) and the voice chat's loudspeaker character (with_speaker; env gets
+    BB_VOICE_GLYPH=1 when the fonts have it), with Xbox prompts also the Options page's Xbox
+    controller diagram (xbox_controls), each keeping the patch base ({guest: patch file})
+    has for the same archive. Kept between launches while the archives, the art and the base
+    patches are the same."""
     import hashlib
     import json
-    art_path = ART / f'{style}.png'
+    style = chosen_style(config, env)
+    env.pop('BB_VOICE_GLYPH', None)
+    art_path = ART / f'{style}.png' if style != 'playstation' else None
     folder = Path(out) / 'button_prompts'
     from mod_file_paths import resolve
-    archives = [resolve(Path(game) / 'archives' / name) for name in ARCHIVES if resolve(Path(game) / 'archives' / name).is_file()]
-    stamp = {'style': style, 'art': hashlib.sha256(art_path.read_bytes()).hexdigest(), 'fonts': list(FONTS),
+    names = list(ARCHIVES) + [name for name in CONTROLS_ARCHIVES if name not in ARCHIVES]
+    archives = [resolve(Path(game) / 'archives' / name) for name in names if resolve(Path(game) / 'archives' / name).is_file()]
+    stamp = {'code': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+             'style': style, 'art': hashlib.sha256(art_path.read_bytes()).hexdigest() if art_path else '',
+             'speaker': hashlib.sha256(SPEAKER_ART.read_bytes()).hexdigest(), 'fonts': list(FONTS),
              'archives': {a.name: [a.stat().st_size, a.stat().st_mtime_ns] for a in archives},
              'base': {g: hashlib.sha256(Path(p).read_bytes()).hexdigest() for g, p in sorted(base.items())}}
     stamp_file = folder / 'stamp.json'
+    made = {}
     try:
         made = json.loads(stamp_file.read_text(encoding='utf-8'))
         if made['stamp'] == stamp and all(Path(p).is_file() for p in made['patches'].values()):
+            if made.get('speaker'):
+                env['BB_VOICE_GLYPH'] = '1'
             return {g: Path(p) for g, p in made['patches'].items()}
-    except (OSError, ValueError, KeyError):
+    except (OSError, ValueError, KeyError, TypeError):
         pass
-    art = read_png(art_path)
+    from cache_cleanup import discard_files
+    if isinstance(made, dict) and isinstance(made.get('patches'), dict):
+        discard_files(folder, made['patches'].values())
+    art = read_png(art_path) if art_path else None
+    glyph = read_png(SPEAKER_ART)
     folder.mkdir(parents=True, exist_ok=True)
-    patches = {}
+    patches, speakers, diagrams = {}, 0, 0
     for path in archives:
         archive = Archive(path)
         entries = {}
         for f in archive.files:
-            if f['path'].replace('\\', '/').lower() in [name.lower() for name in FONTS]:
-                entries[f['index']] = restyled_font(bytes(archive.extract(f)), art)
+            entry = f['path'].replace('\\', '/').lower()
+            if style == 'xbox' and path.name in CONTROLS_ARCHIVES and entry == CONTROLS_SCRIPT.lower():
+                script = xbox_controls(bytes(archive.extract(f)))
+                if script is not None:
+                    entries[f['index']] = script
+                    diagrams += 1
+                continue
+            if path.name in ARCHIVES and entry in [name.lower() for name in FONTS]:
+                blob = bytes(archive.extract(f))
+                styled = restyled_font(blob, art) if art else blob
+                spoken = with_speaker(styled, glyph)
+                speakers += spoken is not None
+                if spoken is not None or art:
+                    entries[f['index']] = spoken if spoken is not None else styled
         if not entries:
             continue
         guest = f'/app0/archives/{path.name}'
         target = folder / (path.stem + '.bbpatch')
         archive_patch.write_entries_patch(target, path, guest, entries, base.get(guest))
         patches[guest] = target
-    stamp_file.write_text(json.dumps({'stamp': stamp, 'patches': {g: str(p) for g, p in patches.items()}}),
-                          encoding='utf-8')
-    say(f'{style} buttons in {sum(1 for _ in patches)} archives')
+    stamp_file.write_text(json.dumps({'stamp': stamp, 'patches': {g: str(p) for g, p in patches.items()},
+                                      'speaker': speakers > 0}), encoding='utf-8')
+    if speakers:
+        env['BB_VOICE_GLYPH'] = '1'
+    say(f'{style} buttons, the loudspeaker in {speakers} fonts, ' +
+        (f'the Xbox controls diagram in {diagrams} scripts, ' if style == 'xbox' else '') + f'{len(patches)} archives')
     return patches
 
 

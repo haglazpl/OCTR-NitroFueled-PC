@@ -19,7 +19,7 @@ inline bool IsFsr4(int upscaler) {
 }
 enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerformance, PresetCount };
 enum DebugView : int { DebugNone = 0, DebugReactive = 1, DebugMotion = 2, DebugViewCount };
-enum class MenuLanguage { English, Russian, Spanish };
+enum class MenuLanguage { English, Russian, Spanish, French, Portuguese, German, Italian };
 /// Where trophy, friend and other notices show (bbport.ini notice_position).
 enum NoticePosition : int { NoticeTopRight = 0, NoticeTopLeft, NoticeBottomRight, NoticeBottomLeft, NoticeTopCentre,
                             NoticeBottomCentre, NoticeCount };
@@ -65,6 +65,7 @@ inline constexpr int GamePatchCount = int(sizeof(GamePatches) / sizeof(GamePatch
 /// 1080p; scripts/patches.py and run.py apply it at start, docs/sacredfire/13-resolution.md).
 inline constexpr int RenderResHeights[] = {480, 720, 1080, 1440, 1620, 2160};
 inline constexpr int RenderResCount = 6;
+inline constexpr int FpsLimits[] = {0, 30, 60, 72, 90, 120, 144, 240};
 /// Display shape (aspect_ratio); the corrected wide modes also accept the older widescreen keys.
 enum AspectRatio : int { Aspect16x9 = 0, Aspect16x10, Aspect21x9, Aspect32x9, AspectRatioCount };
 inline constexpr const char* AspectRatioKeys[] = {"16x9", "16x10", "21x9", "32x9"};
@@ -94,8 +95,11 @@ inline constexpr const char* DlssQualityNames[] = {"auto", "dlaa", "quality", "b
 inline constexpr int DlssQualityCount = 6;
 /// bbport.ini dlss_output: the picture DLSS outputs with a quality mode (1080p or 4K).
 inline constexpr int DlssOutputHeights[] = {1080, 2160};
-/// bbport.ini dlss_model: transformer (NVIDIA's default presets K/L/M) or cnn (preset E).
-inline constexpr const char* DlssModelNames[] = {"transformer", "cnn"};
+/// bbport.ini dlss_model: transformer (the DLL's default preset per mode: K for DLAA, Quality and
+/// Balanced, M for Performance, L for Ultra Performance), cnn (preset E) or transformer_k (preset K
+/// in every mode, lighter than M and L). The index is the saved value's: new names go at the end.
+inline constexpr const char* DlssModelNames[] = {"transformer", "cnn", "transformer_k"};
+inline constexpr int DlssModelCount = 3;
 
 struct Values {
     std::array<std::array<char, 64>, ControllerPorts> ports{}; ///< guarded by PortsMutex()
@@ -116,6 +120,19 @@ struct Values {
     std::atomic<bool> show_fps{false};
     /// show_ping: the round trip to the players in the online room, under the FPS counter.
     std::atomic<bool> show_ping{false};
+    /// Voice chat in private rooms (bbport_voice.cpp): off by default. Push to talk with voice_key
+    /// (an SDL scancode, V) or an open microphone above voice_threshold; voice_input is the
+    /// microphone by name ("" the system's), guarded by PortsMutex().
+    std::atomic<bool> voice_enabled{false};
+    std::atomic<bool> voice_open_mic{false};
+    std::atomic<int> voice_key{25};
+    std::atomic<float> voice_volume{1.0f};
+    std::atomic<float> voice_mic_gain{1.0f};
+    std::atomic<float> voice_threshold{0.06f};
+    /// In a race, each voice as loud as its kart is near, from its side (off: all alike).
+    std::atomic<bool> voice_proximity{true};
+    std::atomic<bool> voice_swap_sides{false}; ///< left and right the other way round
+    std::array<char, 128> voice_input{};
     /// RyuNET friends (the menu's Friends tab): no "friend online" notices; appear offline to
     /// friends (the server hides it); no friend notices at all.
     std::atomic<bool> friends_hide_activity{false};
@@ -134,6 +151,12 @@ struct Values {
     /// patch lets the game run as fast as the machine goes; 60 is the pace it was made for.
     /// Applies at once. BB_FPS_LIMIT overrides it.
     std::atomic<int> fps_limit{60};
+    /// Native renderer supports live scene targets, pacing and motion-blur variants.
+    std::atomic<bool> native_live_graphics{false};
+    std::atomic<bool> shad_live_graphics{false};
+    bool LiveGraphics() const { return native_live_graphics || shad_live_graphics; }
+    std::atomic<bool> native_resolution_requested{false};
+    std::atomic<int> native_scene_height{0};
     /// SacredFire: graphics pipelines compiled on worker threads (BB_ASYNC_PIPELINES): a new
     /// shader no longer stops the game; a pass drawn every frame may miss a frame or two.
     /// Experimental (STATUS.md, issue #2). Applies at once. BB_ASYNC_PIPELINES overrides it.
@@ -214,6 +237,40 @@ struct Values {
     int startup_temporal = TemporalFsr1, startup_dlss_quality = 0, startup_dlss_output = 0;
     int startup_output_res = OutputDefault;
     int startup_live_resolution = 0;
+
+    bool GraphicsRestartRequired() const {
+        bool pending = object_motion != startup_object_motion || model_lod != startup_model_lod ||
+                       live_resolution != startup_live_resolution || aspect_ratio != startup_aspect_ratio;
+        for (int i = 0; i < EffectCount; ++i) pending |= effects[i] != startup_effects[i];
+        for (int i = 0; i < GamePatchCount; ++i) {
+            if (LiveGraphics() && i < 2) continue;
+            pending |= game_patches[i] != startup_game_patches[i];
+        }
+        return pending;
+    }
+
+    void SetRenderResolution(int value) {
+        render_res = value;
+        if (LiveGraphics()) {
+            native_resolution_requested = true;
+            if (temporal == TemporalDlss) dlss_quality = 0;
+        }
+    }
+
+    void SetAspectRatio(int ratio) {
+        aspect_ratio = ratio;
+        ultrawide = 0;
+        if (ratio == Aspect16x9) return;
+        const int w = aspect_w, h = aspect_h;
+        const bool tall = (w == 1920 && h == 1200) || (w == 1280 && h == 800) || (w == 2560 && h == 1600);
+        const bool wide = (w == 3440 && h == 1440) || (w == 2560 && h == 1080);
+        const bool super = (w == 5120 && h == 1440) || (w == 3840 && h == 1080) ||
+                           (w == 2560 && h == 720) || (w == 7680 && h == 2160);
+        if (!((ratio == Aspect16x10 && tall) || (ratio == Aspect21x9 && wide) || (ratio == Aspect32x9 && super))) {
+            aspect_w = ratio == Aspect16x10 ? 1920 : ratio == Aspect21x9 ? 3440 : 5120;
+            aspect_h = ratio == Aspect16x10 ? 1200 : 1440;
+        }
+    }
 };
 
 /// SacredFire: whether the render size the settings ask for differs from the one the game
@@ -226,15 +283,31 @@ void SetUltrawide(bool on);
 
 Values& Get();
 std::mutex& PortsMutex();
+/// The NVSDK_NGX_DLSS_Hint_Render_Preset of dlss_model (nvsdk_ngx_defs.h): 0 the DLL's default
+/// for the mode, 5 E (CNN), 11 K. BB_DLSS_PRESET, where the renderers read it, goes first.
+inline unsigned DlssModelPreset() {
+    static constexpr unsigned presets[DlssModelCount] = {0u, 5u, 11u};
+    const int model = Get().dlss_model;
+    return presets[model >= 0 && model < DlssModelCount ? model : 0];
+}
 /// Localized overlay text; the Language selector itself stays in English.
 const char* MenuText(const char* english, const char* russian);
 /// v0.4: the Spanish of an English menu text (bbport_menu_es.cpp); the English one if missing.
 const char* Spanish(const char* english);
+/// The French, Portuguese, German or Italian (language 0..3) of an English menu text
+/// (bbport_menu_more.cpp, generated by tools/menu_texts.py); the English one if missing.
+const char* MoreLanguages(const char* english, int language);
+/// bbport.ini's code of a menu language (en, ru, es, fr, pt, de, it), and the language of a code
+/// (English when unknown; ok tells whether it was known).
+const char* MenuLanguageCode(MenuLanguage language);
+MenuLanguage MenuLanguageOf(const char* code, bool* ok = nullptr);
 /// An English-only label in the menu's language (Spanish when chosen, else English).
 inline const char* Label(const char* english) { return MenuText(english, english); }
 
 /// Reads the file, then the environment overrides. Called once at start.
 void Load();
+/// Imports changed settings from disk without resetting startup state or pending local edits.
+bool Refresh(bool force = false);
 /// Checks the loaded choice before the first frame; unsupported FSR 4 uses FSR 3.1.
 void ConfigureUpscalerSupport(bool fsr4, bool fsr411);
 /// Startup-patched scene dimensions cannot change until run.sh prepares a new image.

@@ -292,17 +292,28 @@ def main():
     python = bundle_python(folder, a.dist / 'pycache')
     bundle_iced_x86(folder, a.dist / 'pycache')
     shutil.copy2(ROOT / 'run.py', folder)
+    (folder / 'launcher').mkdir(exist_ok=True)
+    shutil.copy2(ROOT / 'launcher/io.github.sacredfire.Launcher.png', folder / 'launcher')
     # No docs/ (v0.8.5): the mod guides are read on GitHub (the launcher's Mods tab links them).
     for script in (ROOT / 'scripts').glob('*.py'):
         shutil.copy2(script, folder / 'scripts')
-    # assets: the art the port puts into the game (scripts/ctr_tv_logo.py)
-    for data in ('aspect_ratio_data', 'widescreen_data', 'button_prompts', 'assets'):
+    # assets: the art the port puts into the game (scripts/ctr_tv_logo.py); tacho_pack: Pack Tacho's
+    # game files (scripts/tacho_pack.py)
+    for data in ('aspect_ratio_data', 'widescreen_data', 'button_prompts', 'assets', 'tacho_pack'):
         shutil.copytree(ROOT / 'scripts' / data, folder / 'scripts' / data, dirs_exist_ok=True)
+    # lang/: the port's translations, read by scripts/octr_texts.py at start-up (online_mode.py, tacho_pack.py)
+    shutil.copytree(ROOT / 'lang', folder / 'lang', dirs_exist_ok=True)
     shutil.copy2(ROOT / 'tools' / 'gen_import_names.py', folder / 'tools')
     # The native Vulkan renderer's shader build (scripts/native_shaders.py): the translator, its
     # driver script and DXC. Only dxc.exe and dxcompiler.dll: SPIR-V needs no dxil.dll.
     (folder / 'tools' / 'shaders').mkdir()
     shutil.copy2(ROOT / 'tools' / 'shaders' / 'build_spirv.py', folder / 'tools' / 'shaders')
+    # The Direct3D 11 engine's (run.py, renderer=d3d11): the translation at the first start, and the
+    # shaders written for the PC with their sources (tools/shaders/native_d3d11.py reads them there).
+    for tool in ('build_d3d11.py', 'native_d3d11.py', 'compile_d3d11.py', 'd3d11_order.txt'):
+        shutil.copy2(ROOT / 'tools' / 'shaders' / tool, folder / 'tools' / 'shaders')
+    shutil.copytree(ROOT / 'gpu' / 'shim' / 'native_shaders', folder / 'gpu' / 'shim' / 'native_shaders',
+                    dirs_exist_ok=True)
     shutil.copytree(ROOT / 'third_party' / 'gcn2hlsl', folder / 'third_party' / 'gcn2hlsl',
                     ignore=shutil.ignore_patterns('__pycache__'))
     dxc_bin = a.dxc_dir / 'bin' / 'x64'

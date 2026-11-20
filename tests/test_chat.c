@@ -7,6 +7,7 @@ static int room_on_now = 1, public_now = 0, following = 0, reply_status = 200, p
 static const char *reply_text = "ok 0\n";
 
 int runtime_online_mode_room_on(void) { return room_on_now; }
+void runtime_online_team_points_heard(const char *nick, const char *data) { (void)nick; (void)data; }
 int runtime_online_mode_public_on(void) { return public_now; }
 int runtime_replay_chat_allowed(void) { return 1; }
 int runtime_room_mode_following(void) { return following; }
@@ -30,6 +31,17 @@ int runtime_ryunet_transfer(const char *method, const char *target, const void *
     return reply_status;
 }
 
+/* One turn of the worker's room choice (choose_room, then leave_room when it changed): the room
+ * it is in now, written to out (which may be the chat's own room). */
+static int worker_step(char out[24]) {
+    char host[24] = "";
+    const int inside = choose_room(host);
+    if (!inside) host[0] = 0;
+    if (strcasecmp(host, room)) leave_room(host);
+    if (out != room) snprintf(out, 24, "%s", host);
+    return inside;
+}
+
 static int view(RcLine *out, int *status) {
     int count = 0;
     runtime_chat_view(out, RC_LINES, &count, status);
@@ -45,16 +57,18 @@ int main(void) {
     remove(path);
 
     /* the first question has no since (nothing said before arrives); the host's says who is in the room */
-    assert(in_room(room) == 1 && !strcmp(room, "Me_1"));
+    assert(worker_step(room) == 1 && !strcmp(room, "Me_1"));
     peers_now = 4;
     poll_room("Me_1");
     assert(!strcmp(requested, "GET /ryunet/chat?name=Me_1&room=Me_1&roster=Guest_1,Guest_2"));
     assert(have_since && since == 0);
     poll_room("Me_1");
     assert(!strcmp(requested, "GET /ryunet/chat?name=Me_1&room=Me_1&since=0&roster=Guest_1,Guest_2"));
-    /* a guest does not */
+    /* a guest does not; another room starts over (nothing said before arrives) */
     following = 1;
-    in_room(room);
+    worker_step(room);
+    poll_room("Me_1");
+    assert(!strcmp(requested, "GET /ryunet/chat?name=Me_1&room=TheHost"));
     poll_room("Me_1");
     assert(!strcmp(requested, "GET /ryunet/chat?name=Me_1&room=TheHost&since=0"));
 
@@ -105,7 +119,7 @@ int main(void) {
 
     /* a public lobby: no roster, the server says who is in, and the panel waits for its yes */
     public_now = 1;
-    assert(in_room(room) == 1 && !strcmp(room, PUBLIC_ROOM));
+    assert(worker_step(room) == 1 && !strcmp(room, PUBLIC_ROOM));
     assert(!runtime_chat_available());
     poll_room("Me_1");
     assert(!strcmp(requested, "GET /ryunet/chat?name=Me_1&public=1"));
@@ -127,9 +141,10 @@ int main(void) {
     poll_room("Me_1");
     assert(runtime_chat_available());
     runtime_chat_set_public(0);
-    assert(!runtime_chat_available());
+    /* the worker's next turn (about a second) leaves the public room: the panel goes */
     char where[24] = "";
-    assert(!in_room(where));
+    assert(!worker_step(where));
+    assert(!runtime_chat_available());
     runtime_chat_set_public(1);
     remove(path);
     puts("chat: ok");

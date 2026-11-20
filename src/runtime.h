@@ -104,33 +104,57 @@ int runtime_time_trial_start(unsigned char *image, size_t size);
  * a player who joins takes it, also when joining by invitation (no selector seen). */
 void runtime_online_mode_adopt(int speed);
 void runtime_online_mode_leave_cup(void);
+void runtime_online_mode_new_session(void); /* game thread: fresh Online menu choice */
+void runtime_online_mode_request_leave(int fresh); /* worker-safe; consumed on game thread */
 int runtime_online_mode_private_speed(void);
+int runtime_online_mode_itemless_collision(void);
 int runtime_online_mode_private_cup(void);
 int runtime_online_mode_private_single_options(void);
 int runtime_online_mode_private_teams(void);
 int runtime_online_mode_in_private(void);
 int runtime_online_mode_lobby_open(void);        /* an online lobby is on screen */
+void runtime_online_mode_selector_left(void);
 void runtime_online_mode_note_frame(void);       /* the game's thread, every frame */
+/* A private room's member, for the overlay's members list by team (bbport_overlay.cpp mirrors it). */
+typedef struct { char name[40]; int team, ready, local; } TeamLobbyMember;
+int runtime_online_team_lobby(TeamLobbyMember *out, int max, int *teams);   /* any thread; -1 none */
+void runtime_online_team_request(int team);      /* the local player's team, picked in the room (any thread) */
+int runtime_online_team_requested(void);         /* that pick, -1 none */
+int runtime_online_team_color(int team, unsigned char rgb[3], char *name, size_t size);  /* palette index */
+int runtime_online_team_screen(float rects[4][4]);   /* team screen columns to draw (x, y, w on the 1080p canvas); 0 none */
 int runtime_online_mode_room_on(void);           /* in_private as of the last frame, for any thread */
 int runtime_online_mode_public_on(void);         /* a public match's lobby as of the last frame */
 void runtime_load_guard_note(const void *buffer, size_t size); /* the game's stdout/stderr writes: a level load that cannot finish restarts the game (runtime_load_guard.c) */
 void runtime_presence_tick(void);                /* the game's thread, every frame: Discord presence facts (runtime_presence.c) */
 int runtime_online_mode_private_cup_race(void); /* a race of a private room's CUP is loading or running */
 void runtime_room_mode_hosting(void);
+void runtime_room_mode_takeover(void);
 void runtime_room_mode_joined(const char *session_id);
 void runtime_room_mode_left(void);
 int runtime_room_mode_following(void);
 void runtime_room_mode_host_name(char out[24]);
+/* Whether this nickname hosts the room on screen (runtime_room_host.c): the room list's crown. */
+int runtime_room_host_is(const char *nick);
 int runtime_room_mode_ready(void);
 /* 1 verified/frozen, 0 rejected, -1 background verification pending. */
 int runtime_room_mode_begin_race(void);
+int runtime_room_mode_race_frozen(void);
 void runtime_room_mode_end_race(void);
 int runtime_public_itemless_start(unsigned char *image, size_t size);
 int runtime_public_itemless_available(void);
 int runtime_public_itemless_announce(void);
 int runtime_public_itemless_active(void);
+int runtime_public_itemless_lobby_mode(void);
 int runtime_public_match_active(void);
+int runtime_public_found_room(void);
+uint64_t runtime_public_room(void);
+int runtime_public_ranked_short(void);
+int runtime_public_ranked_min_players(void); /* players a Ranked room needs, as the server said (0 until then: unknown) */
+int runtime_public_ranked_clock(int64_t *since_ms, int *players); /* 1: the server's Ranked countdown clock is fresh; since_ms -1 = short of players */
+int runtime_online_mode_room_players(void);   /* players in the online room (the game's list) */
+int runtime_online_mode_ranked_waiting(void);  /* a Ranked room short of players: countdown held, "WAITING 2/3" shown */
 int runtime_private_match_active(void);
+int runtime_online_party_active(void);
 /* 1 accepted, 0 rejected, -1 asynchronous check pending. */
 int runtime_private_party_check(void);
 void runtime_private_party_defer_start(void *self, void (ABI *resume)(void *));
@@ -138,15 +162,60 @@ int runtime_private_party_update(void);
 void runtime_private_party_cancel(void);
 int runtime_private_difficulty_modified(void);
 int runtime_public_itemless_selected(void);
+int runtime_public_itemless_match_active(void);
+void runtime_public_itemless_party_left_notice(void);
+void runtime_public_itemless_abort_queue(void);
+void runtime_public_itemless_poll_ranked_request(void); /* the game's thread: ryunet_ranked.txt (Discord Join) */
+int runtime_public_itemless_ranked_request_take(void);   /* Mode Select: the requested Ranked mode once, -1 none */
 void runtime_public_itemless_select(int enabled);
+int runtime_ranked_active(void);
+int runtime_ranked_selected(void);
+/* -1 checking, 0 closed/unavailable, 1 open; fresh rechecks before entry. */
+int runtime_ranked_status(int fresh);
+int runtime_ranked_account(void); /* 1 may enter Ranked, 0 must link Discord or Steam first, -1 not known yet */
+void runtime_ranked_gate_update(void *root, int ranked);
+/* The confirmed ranked room and its queue (0 Normal, 1 Itemless), 0 not ranked. */
+int runtime_ranked_session(uint64_t *room, int *mode);
+/* One racer of the validated finish order, best first (runtime_ranked.c). */
+struct runtime_ranked_racer { char name[32]; int finished; int pos; }; /* pos: the on-screen finish position (AIs take their own slots, honestly) */
+/* The finish order of the race just ended, 0 none (runtime_online_mode.c). */
+int runtime_online_mode_ranked_order(struct runtime_ranked_racer *out, int max);
+/* Ranked results: the worker thread, the report at race end, the lobby card's suffix. */
+void runtime_ranked_start(void);
+void runtime_ranked_race_end(void);
+/* The member's current Ranked tier (1..7), or 0 when unavailable. */
+int runtime_ranked_tier(const char *name, int *mode);
+int runtime_ranked_badge(const char *name, int *mode); /* -1 for an empty/placeholder slot. */
+int runtime_ranked_profile(const char *name, int mode, int *tier, int *mmr, int *placements, int *position);
+void runtime_online_mode_ranked_menu_update(unsigned char *root, int shown, int mode);
+int runtime_ranked_mmr(const char *name);
+const char *runtime_ranked_tier_name(int mode, int tier);
+void runtime_online_mode_set_text(void *placeable, const char *text);
+void runtime_online_mode_show_placeable(void *placeable, int shown);
+void runtime_online_mode_hof_legend(void *project);
+int runtime_online_mode_hof_activate(void *project);
+void runtime_online_mode_hof_cycle(void *placeable, int direction);
+void *runtime_online_mode_content(void *placeable);
 void runtime_public_itemless_reset(void);
+void runtime_public_itemless_new_session(void);
+void runtime_public_itemless_menu_return(void);
+void runtime_public_itemless_guest_left(const char *session_id);
+void runtime_public_itemless_guest_room(int inside);
+void runtime_public_itemless_takeover_host(void);
 void runtime_public_itemless_party_ready(void);
 void runtime_public_itemless_update(void);
+int runtime_matchmaking_view(int *elapsed, int *timeout, int *range, int *ranked);
+void runtime_online_mode_matchmaking_update(unsigned char *root);
+int runtime_online_mode_matchmaking_timeout(void);
+int runtime_online_mode_matchmaking_cancel(int route); /* 0 search, 1 room leave, 2 host-closed/Waiting Room */
+void runtime_online_mode_set_return_mode(int index); /* 0 Casual, 1 Itemless, 2 Ranked */
+int runtime_online_mode_return_mode(void);
 int runtime_speed_mode_enabled(void);
 int runtime_speed_race_active(void);
 void runtime_race_options_leave_room(void);
 void runtime_race_options_map_loading(const char *map);
 int runtime_race_options_start(unsigned char *image, size_t size);
+int runtime_profile_item_guard_start(unsigned char *image, size_t size); /* runtime_profile_guard.c */
 void runtime_race_options_stop_boost(void *boost, void (ABI *stop)(void *));
 int runtime_itemless_start(unsigned char *image, size_t size);
 /* Item-hit diagnostics: "[ITEM]" log lines for potion touches, impacts and kart damage (BB_ITEM_TRACE=0: off). */
@@ -182,9 +251,24 @@ int runtime_rtc_clock_take(uint64_t *network_ticks, uint64_t *current_ticks, uin
 void runtime_net_set_image(const unsigned char *image, size_t size);
 /* One of the image's executable segments: the only memory the send-chain scan reads code bytes from. */
 void runtime_net_add_code(const unsigned char *start, size_t size);
+int runtime_itemless_collisions_disabled(void);
+/* N.Sane Mode (runtime_nsane.c, runtime_file.c): a second stored item in private N.Sane races. */
+int runtime_nsane_start(unsigned char *image, size_t size);
+int runtime_hero_guard_start(unsigned char *image, size_t size);
+int runtime_nsane_available(void);
+void runtime_nsane_map_loading(const char *map);
+void runtime_nsane_tick(void);                   /* the game's thread, every frame: the second slot's roulette */
+void runtime_nsane_mode_set(int enabled);
+int runtime_nsane_mode_enabled(void);
+int runtime_nsane_race_active(void);
+int runtime_online_mode_private_nsane(void);
 int runtime_replay_start(unsigned char *image, size_t size); /* runtime_replay.c (spectator build) */
 /* 1 while a replay of a race without item crates (Time Trial, Itemless) loads or plays (runtime_replay_play.c) */
 int runtime_replay_no_crates(void);
+/* 1 while a replay or a spectated race has the recorded racer's driver, outfit, kart or look on
+ * the player (runtime_replay_play.c, until give_back): a save the game writes then goes to a copy
+ * that is thrown away (runtime_savedata.c), not into the player's own. */
+int runtime_replay_keeps_save_aside(void);
 /* SacredFire online: the running game's title id for the PSN data (runtime_services.c). */
 void runtime_np_set_title(const char *title_id);
 void runtime_file_report(void);
@@ -221,6 +305,53 @@ void runtime_services_user_change(int user, int login);
 uintptr_t runtime_rtc_resolve(const char *name);
 const char *runtime_file_user_dir(void);
 const char *runtime_file_progress_dir(void); /* saves and trophies: BB_PROGRESS_DIR or the user folder */
+/* Pack Tacho's reserves bar starts off (runtime_reserves_bar.c). */
+void runtime_reserves_bar_start(unsigned char *image, size_t size);
+void runtime_reserves_bar_save_closed(void);  /* the game closed its save (runtime_savedata.c) */
+void runtime_reserves_bar_tick(void);         /* the game's thread, every frame */
+/* Voice chat (gpu/shim/bbport_voice.cpp): the race's karts with their players' names, as of the
+ * last frame (runtime_item_lead.c); 0 outside a race. here: a player of this PC. */
+/* effects: what an item does to that kart, for its voice (runtime_item_lead.c): the bubble shield (muffled),
+ * N. Tropy's clock (lower, slowed), Invisibility (an echo), a TNT on the head (covered, as a hand over the mic)
+ * and squashed (the same, much stronger: nothing understood) */
+enum { RUNTIME_VOICE_BUBBLE = 1, RUNTIME_VOICE_CLOCK = 2, RUNTIME_VOICE_INVISIBLE = 4, RUNTIME_VOICE_TNT = 8, RUNTIME_VOICE_CRUSHED = 16 };
+struct RuntimeVoiceKart { char name[24]; float pos[3]; int here; int effects; };
+int runtime_voice_karts(struct RuntimeVoiceKart *out, int max);
+/* Where the game shows each racer's nickname over its kart (HUD kart markers, in the game's
+ * 1920x1080 UI units), copied a few times a second during a race (runtime_replay_play.c). */
+struct RuntimeVoiceMarker { char name[24]; float x, y, scale; int shown; };
+void runtime_voice_markers_tick(int racing);
+/* 1 while that player is heard (or this player talks): gpu/shim/bbport_voice.cpp. */
+int runtime_voice_speaking(const char *nick);
+/* The party's players by name, as of the lobby's last frame (runtime_public_itemless.c). */
+int runtime_room_members(char out[][24], int max);
+int runtime_voice_markers(struct RuntimeVoiceMarker *out, int max);
+/* 1 when the game's fonts have the loudspeaker character (BB_VOICE_GLYPH=1, scripts/button_prompts.py): the
+ * nickname over a talking racer's kart then ends with it. */
+int runtime_voice_glyph(void);
+/* The port's own texts in the game's language (src/runtime_text.c, scripts/octr_texts.py): the
+ * translation of an English text, or the text itself when it has none. runtime_text_is: a shown
+ * text is that English text or its translation. */
+const char *runtime_text(const char *english);
+int runtime_text_is(const char *shown, const char *english);
+int runtime_text_column(void);
+void runtime_text_set_language(int id);
+/* Host handoff research (runtime_party_experiment.c): Ctrl+F9 / Ctrl+Shift+F9 / Ctrl+F10 in a lobby. */
+int runtime_party_experiment_start(unsigned char *image, size_t size);
+void runtime_party_experiment_request(int kind); /* any thread: 1 leave+host, 2 close+host, 3 join */
+int runtime_party_hosting(void);                 /* this player hosts its party */
+void runtime_party_host_lost(int role, int private_match, int announced_return); /* old host connection was torn down */
+void runtime_party_experiment_tick(void);          /* the game's thread, in an online lobby */
+/* Server-backed private-room parties (opt-in BB_PARTY_SERVER=1, runtime_party_server.c). */
+void runtime_party_server_init(void);
+int runtime_party_server_enabled(void);
+int runtime_party_server_create(const char *sid);         /* host: create on server */
+int runtime_party_server_join(const char *sid);           /* guest: join on server */
+int runtime_party_server_promote(const char *successor);  /* host: promote before quit */
+void runtime_party_server_tick(void);                     /* guest: poll for host change */
+void runtime_party_server_defer_promote(const char *successor); /* host: promote after a race ends */
+void runtime_party_server_matchmaking(int i_am_host, const char *host_name); /* shared session for a queue */
+void runtime_party_server_matchmaking_leave(void); /* queue quit: DELETE me from the shared session */
 void runtime_savedata_configure(const char *title);
 const char *runtime_savedata_title(void);
 /* The game's TITLE_ID: where its trophies are kept (<user>/trophies/<title>/). */
@@ -230,4 +361,8 @@ void runtime_trophy_badges(const char *json); /* the server's badges: OCTR's tro
 uintptr_t runtime_savedata_resolve(const char *name);
 void runtime_savedata_report(void);
 void runtime_thread_attach_host(const char *name);
+
+/* Notify the retained native leaderboard graph after the HOF view is initialized. */
+void runtime_hof_native_ready(void *project);
+void runtime_hof_focus_list(void *placeable);
 #endif

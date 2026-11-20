@@ -19,6 +19,9 @@ data=${BB_DATA_DIR:-.}
 out=$data/out
 mkdir -p "$out"
 export BB_CONFIG=${BB_CONFIG:-$data/bbport.ini}
+export BB_WINDOW_ICON=${BB_WINDOW_ICON:-$PWD/launcher/io.github.sacredfire.Launcher.png}
+# the game's title font for the room's members by team (run.py does the same)
+export BB_TEAM_FONT=${BB_TEAM_FONT:-$PWD/art/ctr-title.ttf}
 if [[ -z ${BB_PREBUILT:-} && -z ${BB_IN_NIX_SHELL:-} ]] && ! { command -v pkg-config >/dev/null && pkg-config --exists vulkan sdl3; } && command -v nix-shell >/dev/null; then
     args=''; if (( $# )); then args=$(printf '%q ' "$@"); fi
     exec env BB_IN_NIX_SHELL=1 nix-shell shell.nix --run "bash run.sh $args"
@@ -73,6 +76,7 @@ fi
 # read-only link tree of the merged CTR dump (update 1.21 over the base game).
 game=${BB_GAME_DIR:-orig/CUSA13795}
 if [[ ! -f $game/eboot.bin ]]; then echo "No eboot.bin in $game (set BB_GAME_DIR)." >&2; exit 1; fi
+source_game=$game   # the game's own files, before any mod (scripts/online_content.py)
 # The game check (scripts/game_check.py) compares the executable image with the supported one
 # (Crash Team Racing Nitro-Fueled CUSA13795 1.21) and names the profile the runtime reads.
 profile=$(startup_python scripts/game_check.py "$game") || { echo "$profile" >&2; exit 2; }
@@ -170,6 +174,23 @@ if [[ -f $out/online_playlist.bbpatch ]]; then base_patches=(--base "$out/online
 while IFS= read -r patch; do
     if [[ -n $patch ]]; then base_patches+=(--base "$patch"); fi
 done < <(startup_python scripts/button_prompts.py "$game" --out "$out" --settings "$BB_CONFIG" "${base_patches[@]}")
+# ...and the voice chat's loudspeaker character in them: the nickname over a talking racer shows it.
+unset BB_VOICE_GLYPH
+if grep -q '"speaker": true' "$out/button_prompts/stamp.json" 2>/dev/null; then export BB_VOICE_GLYPH=1; fi
+# Then, as run.py (scripts/startup_extras.py): the seasonal title screen, the nickname bottom left
+# of the menus online, the CTR TV logo and Pack Tacho's files (its executable patches need them:
+# without them a race crashed while loading), each keeping the patches before it.
+extras_patches=() extras_fail=
+while IFS= read -r line; do
+    case $line in
+        patch=*) extras_patches+=(--base "${line#patch=}") ;;
+        env.*=*) line=${line#env.}; export "${line%%=*}=${line#*=}" ;;
+        fail=*) extras_fail=${line#fail=} ;;
+        ?*) echo "$line" ;;
+    esac
+done < <(startup_python scripts/startup_extras.py "$game" --out "$out" --settings "$BB_CONFIG" "${base_patches[@]}")
+if [[ -n $extras_fail ]]; then echo "$extras_fail" >&2; exit 3; fi
+if (( ${#extras_patches[@]} )); then base_patches=("${extras_patches[@]}"); fi
 # The aspect ratio (bbport.ini aspect_ratio, scripts/aspect_ratio.py), as run.py: the
 # render path and the patches read its settings, and it adds its archive patches (the playlist's
 # kept in them), executable patch and HUD scale.
@@ -219,7 +240,7 @@ if [[ ( $title_id == CUSA13795 || $title_id == CUSA14876 ) && $app_version == 01
         echo "TT reference preparation failed; AI retains native route guidance." >&2
     fi
 fi
-unset BB_ONLINE_MODE_HOOK BB_SPEED_MODE
+unset BB_ONLINE_MODE_HOOK BB_SPEED_MODE BB_NSANE_ARCHIVE_PATCHES
 if [[ ${BB_ONLINE:-0} == 1 || ${BB_SPEED_SOLO_TEST:-0} == 1 ]]; then
     if [[ ( $title_id == CUSA13795 || $title_id == CUSA14876 ) && $app_version == 01.21 ]]; then
         speed_bases=()
@@ -228,10 +249,12 @@ if [[ ${BB_ONLINE:-0} == 1 || ${BB_SPEED_SOLO_TEST:-0} == 1 ]]; then
             if [[ -n $speed_patch ]]; then speed_bases+=(--base "$speed_patch"); fi
         done
         if [[ ${BB_ONLINE:-0} == 1 ]]; then
+            echo "Online UI: preparing cached assets" >&2
             mode_result=$(startup_python scripts/online_mode.py "$game" --out "$out/online-mode" \
                 --elf "$boot/eboot.elf" "${speed_bases[@]}") || exit 1
             while IFS='=' read -r key value; do
                 case $key in
+                    'Online UI: '*) echo "$key" >&2 ;;
                     archive_patches) IFS='|' read -r -a speed_existing <<< "$value" ;;
                     online_mode_hook) export BB_ONLINE_MODE_HOOK=$value ;;
                     cup_file_map) export BB_MOD_FILE_MAP=$value BB_MOD_SOURCE_GAME=${BB_MOD_SOURCE_GAME:-$game} ;;
@@ -250,6 +273,7 @@ if [[ ${BB_ONLINE:-0} == 1 || ${BB_SPEED_SOLO_TEST:-0} == 1 ]]; then
             case $key in
                 archive_patches) export BB_ARCHIVE_PATCHES=$value ;;
                 private_archive_patches) export BB_PRIVATE_ARCHIVE_PATCHES=$value ;;
+                nsane_archive_patches) if [[ -n $value ]]; then export BB_NSANE_ARCHIVE_PATCHES=$value; fi ;;
                 'ITEMLESS: private overlays prepared for '* ) echo "$key" ;;
             esac
         done <<< "$speed_result"
@@ -261,10 +285,39 @@ fi
 # keys) or patches.json; BB_PATCHES_DIR replaces the bundled folder. The player's own XML files go
 # in the data folder's patches/ (the launcher's Patches page; the package's folder is read-only).
 fps=${BB_FPS:-30}
+# Contributor testing against a LOCAL RyuNET checkout or any other private server: the game only
+# accepts auth signed by a key it trusts, so a server that is not the production one needs its
+# ctr_ps4 key in $data/ryunet_keys/<host>.pub (or BB_AUTH_KEY=<path>). The data folder is shared
+# with the packaged game, so the patch is removed again on every run that does not need it.
+if [[ ${BB_ONLINE:-0} == 1 ]]; then
+    startup_python scripts/online_key_local.py --data "$data" --server "${BB_ONLINE_SERVER:-}" \
+        ${BB_AUTH_KEY:+--key "$BB_AUTH_KEY"} || exit 1
+else
+    startup_python scripts/online_key_local.py --data "$data" --restore
+fi
 startup_python scripts/patches.py --patches-dir "${BB_PATCHES_DIR:-patches}" --patches-dir "$data/patches" \
     "${layout_patches[@]}" "${strict_overlap[@]}" --patches-config "${BB_PATCHES_CONFIG:-$data/patches.json}" \
     --app-version "$app_version" --title-id "$title_id" --out "$out" --boot-dir "$boot" --settings "$settings"
 patch_args=(--patches "$out/patches.bin")
+# What this launch plays online with (scripts/online_content.py, as run.py): public matchmaking and
+# Ranked take the game's own files and character mods only, private rooms anything.
+unset BB_ONLINE_CONTENT
+if [[ ${BB_ONLINE:-0} == 1 ]]; then
+    content_args=(--game "$source_game" --view "$game" --out "$out" --patches-dir "${BB_PATCHES_DIR:-patches}"
+                  --patches-dir "$data/patches" --app-version "$app_version" --title-id "$title_id")
+    if [[ -n ${BB_MOD_FILE_MAP:-} ]]; then content_args+=(--file-map "$BB_MOD_FILE_MAP"); fi
+    if [[ -n ${BB_MOD_ARCHIVE_PLAN:-} ]]; then content_args+=(--archive-plan "$BB_MOD_ARCHIVE_PLAN"); fi
+    if [[ -n ${layout_patches[1]:-} ]]; then content_args+=(--layout-dir "${layout_patches[1]}"); fi
+    content=unknown
+    while IFS= read -r line; do
+        case $line in
+            class=*) content=${line#class=} ;;
+            ?*) echo "  $line" ;;
+        esac
+    done < <(startup_python scripts/online_content.py "${content_args[@]}" || true)
+    export BB_ONLINE_CONTENT=$content
+    echo "Online content: $content"
+fi
 # bbport.ini render_res / ultrawide (scripts/patches.py render_plan), as run.py: the PS4 Pro path
 # above 1080p, the base path for ultrawide; native 4K's larger GPU heap needs more direct memory.
 read -r plan_pro plan_heap plan_label < <(startup_python scripts/patches.py --print-plan --settings "$settings") || true

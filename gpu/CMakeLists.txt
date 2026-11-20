@@ -159,6 +159,10 @@ add_host_shader(buffer_multi_copy.comp buffer_multi_copy_comp)
 add_host_shader(depth_resample.frag depth_resample_frag)
 add_host_shader(depth_resample.frag depth_stencil_resample_frag HAS_STENCIL=1)
 add_host_shader(depth_resample.frag depth_stencil_bits_frag STENCIL_BITS=1)
+add_host_shader(depth_resample.frag depth_ms_resample_frag MSAA=1)
+add_host_shader(depth_resample.frag depth_stencil_ms_resample_frag MSAA=1 HAS_STENCIL=1)
+add_host_shader(depth_resample.frag depth_stencil_ms_bits_frag MSAA=1 STENCIL_BITS=1)
+add_host_shader(ms_image_blit.frag ms_resample_frag SRC_MSAA=1 RESAMPLE=1)
 add_host_shader(camera_motion.comp camera_motion_debug_comp DEBUG_OVERLAY=1)
 foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)
@@ -177,7 +181,13 @@ set(COMMON
     shim/common/logging/log.cpp)
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+# Voice chat (shim/bbport_voice.cpp): Opus, already shipped beside FFmpeg (libopus-0.dll).
+pkg_check_modules(OPUS REQUIRED IMPORTED_TARGET opus)
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
+if (NOT WIN32)
+    # The Direct3D 11 engine is Windows only; elsewhere shim/bbport_d3d11.cpp builds empty stubs.
+    list(FILTER SHIM_SOURCES EXCLUDE REGEX "/shim/d3d11/")
+endif()
 # Windows: a DLL cannot leave the runtime_* symbols for bb-probe.exe to resolve, so the
 # library is static there and linked into the executable.
 if (WIN32)
@@ -196,6 +206,10 @@ add_dependencies(bbgpu host_shaders)
 target_sources(bbgpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
     third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp
     third_party/imgui/backends/imgui_impl_vulkan.cpp)
+if (WIN32)
+    # The experimental Direct3D 11 engine's menu (shim/bbport_d3d11.cpp).
+    target_sources(bbgpu PRIVATE third_party/imgui/backends/imgui_impl_dx11.cpp)
+endif()
 target_include_directories(bbgpu PRIVATE third_party/imgui third_party/imgui/backends)
 # Dear ImGui stays private to libbbgpu.so. The library is linked into bb-probe, so its exports are
 # in the global symbol scope; a Vulkan layer carrying its own Dear ImGui without -Bsymbolic
@@ -221,7 +235,7 @@ if (NOT WIN32)
 endif()
 target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
 target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
-    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG PkgConfig::OPUS miniz::miniz Zydis::Zydis sirit)
 if (WIN32)
     # Guest code is entered with the System V ABI; NOMINMAX/WIN32_LEAN_AND_MEAN keep
     # <windows.h> out of the way of std::min/max and the Vulkan/SDL headers.
@@ -267,7 +281,7 @@ if (WIN32)
     target_include_directories(sacredfire PRIVATE .. ../src)
     # liblzma (MSYS2 mingw-w64-clang-x86_64-xz), static: the archive decoder (src/runtime_lzma.c)
     find_library(BB_LIBLZMA NAMES liblzma.a REQUIRED)
-    target_link_libraries(sacredfire PRIVATE bbgpu atrac9 ${BB_LIBLZMA} onecore bcrypt ws2_32 -pthread)
+    target_link_libraries(sacredfire PRIVATE bbgpu atrac9 ${BB_LIBLZMA} onecore bcrypt ws2_32 d3d11 dxgi d3dcompiler -pthread)
     # The PS4 range (64 GiB - 1 TiB) must stay free: no high-entropy ASLR for heaps and stacks.
     # The guest main thread runs on the process stack: 16 MiB, committed (no stack probes).
     target_link_options(sacredfire PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")
@@ -275,17 +289,7 @@ if (WIN32)
     target_link_libraries(bb-gpu-capabilities PRIVATE Vulkan::Vulkan PkgConfig::SDL3)
     # The launcher (CTR-NitroFueled-PC.exe, launcher/windows): Dear ImGui on Win32 + Direct3D 11,
     # linked statically, so the .exe next to run.py needs no DLL from bin\.
-    add_executable(ctr-launcher WIN32 ../launcher/windows/launcher.cpp ../launcher/windows/discord_presence.cpp
-        ../launcher/windows/discord_link.cpp ../launcher/windows/nat_check.cpp ../launcher/windows/port_update.cpp
-        ../launcher/windows/settings_import.cpp
-        third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp third_party/imgui/imgui_tables.cpp
-        third_party/imgui/imgui_widgets.cpp third_party/imgui/backends/imgui_impl_win32.cpp
-        third_party/imgui/backends/imgui_impl_dx11.cpp ../packaging/windows/launcher.rc)
-    target_include_directories(ctr-launcher PRIVATE third_party/imgui third_party/imgui/backends)
-    target_compile_definitions(ctr-launcher PRIVATE UNICODE _UNICODE)
-    target_link_options(ctr-launcher PRIVATE -static -municode -s)
-    target_link_libraries(ctr-launcher PRIVATE d3d11 dxgi d3dcompiler dwmapi windowscodecs ole32 shell32 uuid winhttp bcrypt advapi32 ws2_32)
-    set_target_properties(ctr-launcher PROPERTIES OUTPUT_NAME CTR-NitroFueled-PC INTERPROCEDURAL_OPTIMIZATION OFF)
+    add_subdirectory(../launcher launcher)
     # The updater: versions, the release answer, protected files and a rolled-back install.
     add_executable(port-update-test EXCLUDE_FROM_ALL ../tests/test_port_update.cpp ../launcher/windows/port_update.cpp)
     target_compile_options(port-update-test PRIVATE -UNDEBUG -Wall -Wextra)
@@ -333,6 +337,21 @@ if (NOT WIN32)
     set_source_files_properties(../tests/test_native_texture_batch.cpp PROPERTIES
         COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
     target_link_libraries(native-texture-batch-test PRIVATE bbgpu)
+    add_executable(native-live-graphics-test EXCLUDE_FROM_ALL
+        ../tests/test_native_live_graphics.cpp ../tests/test_gpu_runtime_stubs.cpp)
+    target_include_directories(native-live-graphics-test PRIVATE shim shadps4 third_party/gcn/include)
+    target_compile_options(native-live-graphics-test PRIVATE -UNDEBUG -fPIC)
+    set_source_files_properties(../tests/test_native_live_graphics.cpp PROPERTIES
+        COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+    target_link_libraries(native-live-graphics-test PRIVATE bbgpu)
+    set(BLUR_TEST_VERTEX ${CMAKE_CURRENT_BINARY_DIR}/motion-blur-test.vert.spv)
+    add_custom_command(OUTPUT ${BLUR_TEST_VERTEX}
+        COMMAND ${GLSLANG_COMPILER} --target-env vulkan1.3 -V
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_motion_blur.vert -o ${BLUR_TEST_VERTEX}
+        DEPENDS ../tests/test_motion_blur.vert VERBATIM)
+    add_custom_target(motion-blur-test-shader DEPENDS ${BLUR_TEST_VERTEX})
+    add_dependencies(native-live-graphics-test motion-blur-test-shader)
+    target_compile_definitions(native-live-graphics-test PRIVATE BLUR_TEST_VERTEX="${BLUR_TEST_VERTEX}")
     add_executable(native-shader-async-test EXCLUDE_FROM_ALL
         ../tests/test_native_shader_async.cpp ../tests/test_gpu_runtime_stubs.cpp)
     target_include_directories(native-shader-async-test PRIVATE shim shadps4 third_party/gcn/include)
@@ -356,7 +375,8 @@ target_link_libraries(motion-shader-test PRIVATE bbgpu)
 add_executable(ui-composition-test EXCLUDE_FROM_ALL ../tests/test_ui_composition.cpp)
 target_compile_options(ui-composition-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(ui-composition-test PRIVATE ..)
-add_executable(settings-test EXCLUDE_FROM_ALL ../tests/test_settings.cpp shim/bbport_settings.cpp)
+add_executable(settings-test EXCLUDE_FROM_ALL ../tests/test_settings.cpp shim/bbport_settings.cpp shim/bbport_menu_es.cpp
+               shim/bbport_menu_more.cpp)
 target_compile_options(settings-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(settings-test PRIVATE .. shim)
 add_executable(aspect-settings-test EXCLUDE_FROM_ALL ../tests/test_aspect_settings.cpp

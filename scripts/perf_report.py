@@ -13,6 +13,10 @@ times. run.py feeds every line the game prints to a Collector, which groups thos
   "Fault:" line, without addresses, paths or thread numbers); for a lost GPU device what the
   driver said of it (VK_EXT_device_fault) and the GPU command it stopped in (the breadcrumbs:
   draw/dispatch kind and shader hashes), without addresses;
+- for a crash in the game's code, the game's functions that called it (offsets in the game's
+  executable) and the name of the game's thread; for a block the game's allocator found corrupt
+  (and survived), the kind of each word around it (a small number, a pointer, text: never its
+  contents) and the callers;
 - the names of the mods in use (their folders), to tell crashes of mods from the game's.
 
 Nothing personal goes into it: no nickname, key, IP, paths, friends or room. The report is always
@@ -44,6 +48,16 @@ _FAULT_ABORT = re.compile(r'^Fault: abort\(\) called \((.*)\) at (.+?) \(thread 
 _FAULT_OTHER = re.compile(r'^Fault: exception (0x[0-9a-fA-F]+) at (.+?) \(thread \d+\)')
 _GUEST_STOP = re.compile(r'^STOP: guest raised debug exception code=(0x[0-9a-fA-F]+)')
 _CORRUPT_FREE = re.compile(r'^Runtime: bailing corrupt free at guest offset (0x[0-9a-fA-F]+)')
+# probe.c heap_summary: the kinds of the words around the first corrupt block, and its callers
+_CORRUPT_WORDS = re.compile(r'^Runtime: corrupt block words \(block-0x40\.\.\+0x18\):((?: \S+)*); callers:((?: 0x[0-9a-f]+)*)\s*$')
+_WORD_KIND = re.compile(r'0|n[0-9a-f]{1,5}|img\+[0-9a-f]{1,8}|b[+-][0-9a-f]{1,5}|txt|ptr|\?|unread')
+# probe.c fatal_exception, after the "Fault:" line: the guest callers and the guest thread's name
+_FAULT_CALLERS = re.compile(r'^  guest code addresses on the stack \(callers, newest first\):')
+_CALLER = re.compile(r' 0x([0-9a-f]{1,8})@rsp')
+_FAULT_THREAD = re.compile(r'^  guest thread: (.+)$')
+# The game's own out-of-memory stop (0xa95710): "OOM [pool]{id,name}->bytes", then a write to 0x13.
+# Which pool ran out and the request's size: what to enlarge (production's top crash, v0.8.8).
+_OOM = re.compile(r'OOM \[(-?\d+)\]\{(-?\d+),([A-Za-z0-9_ .:/-]{0,40})\}->(\d+)')
 # vk_breadcrumbs.cpp: a lost GPU device's report
 _DEVICE_LOST = re.compile(r'^GPU breadcrumbs at device lost \(([^)]*)\)')
 _DEVICE_FAULT = re.compile(r'^GPU fault info: (.+?) \(\d+ addresses, \d+ vendor records\)')
@@ -151,6 +165,9 @@ class Collector:
         self.gpu = {}
         self.fault = None  # the crash's signature (fault_of), the first one only
         self.corrupt_free = False  # probe.c kept the game going past a corrupt free
+        self.heap = None  # the first corrupt block's word kinds and callers (heap_summary)
+        self.oom = None  # the game's out-of-memory stop: its pool and the request's size
+        self.fault_detail = 0  # lines left to read the stored crash's callers and thread from
         self.started = time.time()
 
     def device_lost(self, line):
@@ -210,9 +227,32 @@ class Collector:
                 self.corrupt_free = True
                 self.fault = self.fault or {'kind': 'corrupt free', 'where': 'guest offset ' + m[1]}
                 continue
-            if (self.fault is None or self.fault['kind'] == 'corrupt free') and line.startswith(('Fault: ', 'STOP: ')):
-                self.fault = fault_of(line) or self.fault  # a crash says more than what it survived
+            m = _OOM.search(line) if self.oom is None and 'OOM [' in line else None
+            if m:
+                self.oom = {'pool': int(m[1]), 'id': int(m[2]), 'name': m[3], 'bytes': int(m[4])}
                 continue
+            m = _CORRUPT_WORDS.match(line)
+            if m:
+                if self.heap is None:
+                    self.heap = {'words': [w if _WORD_KIND.fullmatch(w) else '?' for w in m[1].split()[:12]],
+                                 'callers': m[2].split()[:12]}
+                continue
+            if (self.fault is None or self.fault['kind'] == 'corrupt free') and line.startswith(('Fault: ', 'STOP: ')):
+                crash = fault_of(line)
+                if crash:  # a crash says more than what it survived
+                    self.fault = crash
+                    self.fault_detail = 60
+                continue
+            if self.fault_detail:
+                self.fault_detail -= 1
+                if _FAULT_CALLERS.match(line):
+                    self.fault.setdefault('callers', ['0x' + c for c in _CALLER.findall(line)[:12]])
+                    continue
+                m = _FAULT_THREAD.match(line)
+                if m:
+                    self.fault.setdefault('thread', scrub(m[1], 40))
+                    self.fault_detail = 0
+                    continue
             if self.device_lost(line):
                 continue
             if not self.gpu:
@@ -238,7 +278,8 @@ class Collector:
             'overall': everything.summary() if everything.frames else None,
             'tracks': tracks,
             'ended_in': self.level,
-            **({'fault': self.fault} if self.fault else {}),
+            **({'fault': dict(self.fault, **({'heap': self.heap} if self.heap else {}),
+                              **({'oom': self.oom} if self.oom else {}))} if self.fault else {}),
         }
 
 
